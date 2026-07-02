@@ -19,6 +19,8 @@ batch_size: 32
 epochs: 60
 checkpoint:
 submit:
+wandb: disabled
+wandb_project: sharp
 
 callbacks:
   - _target_: pytorch_lightning.callbacks.ModelCheckpoint
@@ -43,5 +45,4 @@ trainer:
   gradient_clip_algorithm: norm
   sync_batchnorm: true
   default_root_dir: ${output_dir}
-
 
