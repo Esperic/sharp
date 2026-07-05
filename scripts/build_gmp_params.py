@@ -4,6 +4,7 @@ import json
 import pickle
 import sys
 from pathlib import Path
+from time import perf_counter
 
 import numpy as np
 import torch
@@ -21,6 +22,24 @@ def _load_torch(path):
         return torch.load(path, map_location="cpu", weights_only=False)
     except TypeError:
         return torch.load(path, map_location="cpu")
+
+
+def _progress(iterable, total=None, desc="", unit="it", disable=False):
+    if disable:
+        return iterable
+    try:
+        from tqdm import tqdm
+
+        return tqdm(iterable, total=total, desc=desc, unit=unit)
+    except ImportError:
+        def _fallback():
+            for idx, item in enumerate(iterable, start=1):
+                if idx == 1 or idx % 1000 == 0 or (total is not None and idx == total):
+                    total_str = f"/{total}" if total is not None else ""
+                    print(f"{desc}: {idx}{total_str} {unit}")
+                yield item
+
+        return _fallback()
 
 
 def _target_from_processed_dict(sample, future_steps):
@@ -45,6 +64,66 @@ def _target_from_processed_dict(sample, future_steps):
         if mask.shape[0] >= future_steps and not bool(mask[:future_steps].all()):
             return None
     return traj.float()
+
+
+def _rotation_matrix(theta):
+    return torch.stack(
+        [
+            torch.stack([torch.cos(theta), -torch.sin(theta)]),
+            torch.stack([torch.sin(theta), torch.cos(theta)]),
+        ]
+    )
+
+
+def _targets_from_av2_scene_dict(sample, future_steps, split_points=(10, 20, 30, 40, 50), num_historical_steps=10):
+    if not isinstance(sample, dict):
+        return []
+    required = {"focal_idx", "x_positions", "x_angles", "x_valid_mask", "x_attr"}
+    if not required.issubset(sample.keys()):
+        return []
+
+    idx = int(sample["focal_idx"])
+    x_positions = sample["x_positions"]
+    x_angles = sample["x_angles"]
+    x_valid_mask = sample["x_valid_mask"]
+    x_attr = sample["x_attr"]
+    if not torch.is_tensor(x_positions):
+        x_positions = torch.as_tensor(x_positions)
+    if not torch.is_tensor(x_angles):
+        x_angles = torch.as_tensor(x_angles)
+    if not torch.is_tensor(x_valid_mask):
+        x_valid_mask = torch.as_tensor(x_valid_mask)
+    if not torch.is_tensor(x_attr):
+        x_attr = torch.as_tensor(x_attr)
+
+    if idx >= x_positions.shape[0] or x_positions.shape[-1] != 2:
+        return []
+    if x_attr[idx, -1].item() == 3:
+        return []
+
+    trajs = []
+    total_steps = x_positions.shape[1]
+    for step in split_points:
+        st = step - num_historical_steps
+        ed = step + future_steps
+        if st < 0 or ed > total_steps:
+            continue
+        valid = x_valid_mask[idx, st:ed].bool()
+        if valid.shape[0] != num_historical_steps + future_steps:
+            continue
+        target_mask = valid[num_historical_steps - 1] & valid[num_historical_steps:]
+        if not bool(target_mask.all()):
+            continue
+
+        origin = x_positions[idx, step - 1]
+        theta = x_angles[idx, step - 1]
+        rot_mat = _rotation_matrix(theta).to(dtype=x_positions.dtype, device=x_positions.device)
+        local = torch.matmul(x_positions[idx, st:ed] - origin, rot_mat)
+        pos_ctr = local[num_historical_steps - 1].clone()
+        target = local[num_historical_steps:] - pos_ctr.unsqueeze(0)
+        if target.shape == (future_steps, 2) and torch.isfinite(target).all():
+            trajs.append(target.float())
+    return trajs
 
 
 def _dataset_for(dataset, root, future_steps):
@@ -85,12 +164,21 @@ def _dataset_for(dataset, root, future_steps):
     raise ValueError(f"Unsupported dataset={dataset}")
 
 
-def iter_future_trajs(processed_root, dataset, future_steps, max_samples=None, dry_run=False):
+def iter_future_trajs(
+    processed_root,
+    dataset,
+    future_steps,
+    max_samples=None,
+    dry_run=False,
+    dry_run_samples=16,
+    progress=True,
+):
     root = Path(processed_root)
     files = sorted(root.glob("*.pt")) + sorted(root.glob("*.pkl")) + sorted(root.glob("*.pickle"))
     if dry_run:
         print(f"processed_root={root}")
         print(f"found_files={len(files)}")
+        print(f"dry_run_samples={dry_run_samples}")
         if files:
             sample = _load_torch(files[0])
             if isinstance(sample, dict):
@@ -98,6 +186,37 @@ def iter_future_trajs(processed_root, dataset, future_steps, max_samples=None, d
                 print(f"sample_keys={sorted(sample.keys())}")
 
     count = 0
+    file_limit = dry_run_samples if dry_run else None
+    if dataset == "av2":
+        if dry_run:
+            print("extractor=av2_fast_focal_scene_dict")
+        selected_files = files[:file_limit]
+        if progress:
+            try:
+                from tqdm import tqdm
+
+                progress_bar = tqdm(total=len(selected_files), desc="extract_av2_futures", unit="file")
+            except ImportError:
+                progress_bar = None
+        else:
+            progress_bar = None
+        try:
+            for file_idx, path in enumerate(selected_files, start=1):
+                obj = _load_torch(path)
+                if progress_bar is not None:
+                    progress_bar.update(1)
+                elif progress and (file_idx == 1 or file_idx % 1000 == 0 or file_idx == len(selected_files)):
+                    print(f"extract_av2_futures: {file_idx}/{len(selected_files)} file")
+                for traj in _targets_from_av2_scene_dict(obj, future_steps):
+                    yield traj.numpy()
+                    count += 1
+                    if max_samples is not None and count >= max_samples:
+                        return
+        finally:
+            if progress_bar is not None:
+                progress_bar.close()
+        return
+
     use_dataset = True
     try:
         ds = _dataset_for(dataset, root, future_steps)
@@ -107,7 +226,8 @@ def iter_future_trajs(processed_root, dataset, future_steps, max_samples=None, d
         use_dataset = False
 
     if use_dataset:
-        for idx in range(len(ds)):
+        indices = range(len(ds))
+        for idx in _progress(indices, total=len(ds), desc=f"extract_{dataset}_futures", unit="sample", disable=not progress):
             item = ds[idx]
             seq = item if isinstance(item, list) else [item]
             for sample in seq:
@@ -119,7 +239,7 @@ def iter_future_trajs(processed_root, dataset, future_steps, max_samples=None, d
                 if max_samples is not None and count >= max_samples:
                     return
     else:
-        for path in files:
+        for path in _progress(files, total=len(files), desc="extract_targets", unit="file", disable=not progress):
             obj = _load_torch(path)
             candidates = obj if isinstance(obj, list) else [obj]
             for sample in candidates:
@@ -138,11 +258,16 @@ def _fit_kmeans(flat, k, seed):
     except ImportError as exc:
         raise ImportError("scikit-learn is required to build GMP params") from exc
     try:
+        print(f"kmeans_start samples={flat.shape[0]} dims={flat.shape[1]} k={k}")
+        start = perf_counter()
         model = MiniBatchKMeans(n_clusters=k, random_state=seed, batch_size=4096, n_init="auto")
         labels = model.fit_predict(flat)
     except TypeError:
+        print(f"kmeans_start samples={flat.shape[0]} dims={flat.shape[1]} k={k}")
+        start = perf_counter()
         model = MiniBatchKMeans(n_clusters=k, random_state=seed, batch_size=4096, n_init=10)
         labels = model.fit_predict(flat)
+    print(f"kmeans_done seconds={perf_counter() - start:.2f}")
     return labels
 
 
@@ -206,6 +331,8 @@ def main():
     parser.add_argument("--max_samples", type=int, default=300000)
     parser.add_argument("--seed", type=int, default=2333)
     parser.add_argument("--dry_run", action="store_true")
+    parser.add_argument("--dry_run_samples", type=int, default=16)
+    parser.add_argument("--no_progress", action="store_true")
     parser.add_argument("--normalize", choices=["none", "mean_range"], default="none")
     args = parser.parse_args()
 
@@ -215,6 +342,8 @@ def main():
         args.future_steps,
         max_samples=args.max_samples,
         dry_run=args.dry_run,
+        dry_run_samples=args.dry_run_samples,
+        progress=not args.no_progress,
     ))
     if not trajs:
         raise RuntimeError("No valid full-length training future trajectories were extracted.")
