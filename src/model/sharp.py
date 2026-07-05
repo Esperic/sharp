@@ -8,6 +8,8 @@ from .layers.lane_embedding import LaneEmbeddingLayer
 from .layers.transformer_blocks import Block, InteractionModule
 from .layers.custom_transformer_blocks import Block as CustomBlock
 from .layers.multimodal_decoder_attn import MultimodalDecoder            
+from .drifttraj import GaussianMixturePrior
+from .drifttraj.utils import assert_finite_tensor
 from torch.nn.utils.rnn import pad_sequence
 import numpy as np
 
@@ -82,7 +84,12 @@ class Sharp_I(nn.Module):
         self.k = k
 
         # Decoder
-        self.decoder = MultimodalDecoder(use_target_context=False, future_steps=self.future_steps, k=k)
+        self.decoder = MultimodalDecoder(
+            use_target_context=False,
+            embed_dim=embed_dim,
+            future_steps=self.future_steps,
+            k=k,
+        )
         # Auxiliary decoder
         self.dense_predictor = nn.Sequential(
             nn.Linear(embed_dim, 256), nn.ReLU(), nn.Linear(256, self.future_steps * 2)
@@ -117,6 +124,10 @@ class Sharp_I(nn.Module):
             k[len('model.') :]: v for k, v in ckpt.items() if k.startswith('model.') 
         }
         return self.load_state_dict(state_dict=state_dict, strict=False)
+
+
+    def _build_gmp_aux(self, batch_size, device):
+        return None
 
 
     def forward(self, data):
@@ -285,6 +296,12 @@ class Sharp_I(nn.Module):
 
         # add positional embedding to scene encoding after computation of the target-centric features is done
         x_encoder = x_encoder + pos_embed
+        gmp_aux = self._build_gmp_aux(B, x_encoder.device)
+        if gmp_aux is not None:
+            x_encoder = self.gmp_prior.memory_film(x_encoder, gmp_aux['xy'])
+            assert_finite_tensor("gmp_query_delta", gmp_aux["query_delta"])
+            if gmp_aux.get("pi_bias") is not None:
+                assert_finite_tensor("gmp_pi_bias", gmp_aux["pi_bias"])
 
         #################
         # DUAL TRAINING #
@@ -298,7 +315,7 @@ class Sharp_I(nn.Module):
             x_curr = self.norm(x_curr)
             x_agent = x_curr[:, 0]
             aux = [None, None, data]
-            y_hat_single, pi_single, __ = self.decoder(x_agent, x_curr, (~key_valid_mask), N, aux=aux)
+            y_hat_single, pi_single, __ = self.decoder(x_agent, x_curr, (~key_valid_mask), N, aux=aux, gmp_aux=gmp_aux)
         else:
             y_hat_single = None
             pi_single = None
@@ -366,7 +383,7 @@ class Sharp_I(nn.Module):
            aux = [target_encoder, target_mask, data, compressed_target_encoder, compressed_target_mask]
         else:
            aux = [None, None, data]
-        y_hat, pi, aux_dec_ret = self.decoder(x_agent, x_encoder, (~key_valid_mask), N, aux=aux)
+        y_hat, pi, aux_dec_ret = self.decoder(x_agent, x_encoder, (~key_valid_mask), N, aux=aux, gmp_aux=gmp_aux)
         x_mode = aux_dec_ret[0]
 
         ######################
@@ -424,6 +441,9 @@ class Sharp_I(nn.Module):
             'y_hat_single': y_hat_single,
             'pi_single': pi_single
         }
+        if gmp_aux is not None:
+            ret_dict['gmp_xy'] = gmp_aux['xy'].detach()
+            ret_dict['gmp_comp_idx'] = gmp_aux['comp_idx'].detach()
 
         glo_y_hat = torch.bmm(y_hat.detach()[..., :2].reshape(B, -1, 2), torch.inverse(rot_mat))
         glo_y_hat = glo_y_hat.reshape(B, y_hat.size(1), -1, 2)
@@ -455,6 +475,45 @@ class Sharp(Sharp_I):
                  dual=False,
                  biased_interaction=False,
                  ma=False,
+                 use_gmp=False,
+                 use_drift_loss=False,
+                 use_mdf=False,
+                 gmp_path=None,
+                 gmp_k=None,
+                 gmp_std_floor=0.05,
+                 gmp_sampling="query_aligned",
+                 gmp_train_noise_scale=1.0,
+                 gmp_eval_noise_scale=0.0,
+                 gmp_use_center_points=True,
+                 gmp_use_cluster_trajs_for_init=True,
+                 gmp_condition_query=True,
+                 gmp_condition_pi=True,
+                 gmp_condition_memory=False,
+                 use_gmp_prior_logit_bias=True,
+                 gmp_prior_logit_bias_weight=0.05,
+                 use_endpoint_diversity=True,
+                 drift_weight=0.2,
+                 drift_warmup_epochs=5,
+                 drift_space="traj",
+                 drift_detach_target=True,
+                 drift_single_radius=0.1,
+                 drift_force_clip=1.0,
+                 drift_loss_type="mse",
+                 drift_normalize_space=True,
+                 drift_apply_to_single=False,
+                 winner_metric="ade_fde",
+                 winner_fde_weight=1.0,
+                 mdf_r_list=(0.02, 0.1, 0.5),
+                 mdf_normalize_force=True,
+                 mdf_positive_weight=1.0,
+                 mdf_negative_weight=1.0,
+                 mdf_include_old_gen_as_neg=True,
+                 diversity_weight=0.05,
+                 diversity_sigma=2.0,
+                 diversity_warmup_epochs=3,
+                 use_label_smoothing_ce=True,
+                 label_smoothing=0.05,
+                 use_loss_weight_schedule=True,
                  **kwargs):
         super().__init__(**kwargs)
         self.use_stream_encoder = use_stream_encoder
@@ -462,8 +521,61 @@ class Sharp(Sharp_I):
         self.use_target_context = use_target_context
         self.embed_dim = kwargs['embed_dim']
         self.pose_dim = 4
+        self.use_gmp = bool(use_gmp)
+        self.use_drift_loss = bool(use_drift_loss)
+        self.use_mdf = bool(use_mdf)
+        self.gmp_condition_pi = bool(gmp_condition_pi)
+        self.gmp_condition_memory = bool(gmp_condition_memory)
+        self.gmp_prior_logit_bias_weight = float(gmp_prior_logit_bias_weight)
+        self.use_endpoint_diversity = bool(use_endpoint_diversity)
+        self.drift_weight = float(drift_weight)
+        self.drift_warmup_epochs = int(drift_warmup_epochs)
+        self.drift_space = drift_space
+        self.drift_detach_target = bool(drift_detach_target)
+        self.drift_single_radius = float(drift_single_radius)
+        self.drift_force_clip = float(drift_force_clip)
+        self.drift_loss_type = drift_loss_type
+        self.drift_normalize_space = bool(drift_normalize_space)
+        self.drift_apply_to_single = bool(drift_apply_to_single)
+        self.winner_metric = winner_metric
+        self.winner_fde_weight = float(winner_fde_weight)
+        self.mdf_r_list = list(mdf_r_list)
+        self.mdf_normalize_force = bool(mdf_normalize_force)
+        self.mdf_positive_weight = float(mdf_positive_weight)
+        self.mdf_negative_weight = float(mdf_negative_weight)
+        self.mdf_include_old_gen_as_neg = bool(mdf_include_old_gen_as_neg)
+        self.diversity_weight = float(diversity_weight)
+        self.diversity_sigma = float(diversity_sigma)
+        self.diversity_warmup_epochs = int(diversity_warmup_epochs)
+        self.use_label_smoothing_ce = bool(use_label_smoothing_ce)
+        self.label_smoothing = float(label_smoothing)
+        self.use_loss_weight_schedule = bool(use_loss_weight_schedule)
 
-        self.decoder = MultimodalDecoder(use_target_context=self.use_target_context, future_steps=kwargs['future_steps'], k=kwargs['k'], ma=ma)
+        self.gmp_prior = None
+        if self.use_gmp:
+            self.gmp_prior = GaussianMixturePrior(
+                path=gmp_path,
+                k=gmp_k or kwargs['k'],
+                embed_dim=kwargs['embed_dim'],
+                std_floor=gmp_std_floor,
+                sampling=gmp_sampling,
+                train_noise_scale=gmp_train_noise_scale,
+                eval_noise_scale=gmp_eval_noise_scale,
+                condition_query=gmp_condition_query,
+                condition_pi=gmp_condition_pi,
+                condition_memory=gmp_condition_memory,
+                use_prior_logit_bias=use_gmp_prior_logit_bias,
+            )
+
+        self.decoder = MultimodalDecoder(
+            use_target_context=self.use_target_context,
+            embed_dim=kwargs['embed_dim'],
+            future_steps=kwargs['future_steps'],
+            k=kwargs['k'],
+            ma=ma,
+            use_gmp=self.use_gmp,
+            gmp_prior_logit_bias_weight=self.gmp_prior_logit_bias_weight,
+        )
 
         self.dual = dual
         self.biased_interaction = biased_interaction
@@ -548,3 +660,21 @@ class Sharp(Sharp_I):
             grad = []
             for name, param in self.named_parameters():
                 print("grad", name)
+
+    def _build_gmp_aux(self, batch_size, device):
+        if not self.use_gmp or self.gmp_prior is None:
+            return None
+        gmp_xy, gmp_comp_idx = self.gmp_prior.sample_xy(
+            batch_size=batch_size,
+            num_queries=self.k,
+            device=device,
+            training=self.training,
+        )
+        query_delta = self.gmp_prior.xy_to_query_delta(gmp_xy)
+        pi_bias = self.gmp_prior.xy_to_pi_bias(gmp_xy, gmp_comp_idx) if self.gmp_condition_pi else None
+        return {
+            'xy': gmp_xy,
+            'comp_idx': gmp_comp_idx,
+            'query_delta': query_delta,
+            'pi_bias': pi_bias,
+        }

@@ -10,6 +10,19 @@ import numpy as np
 
 from src.metrics import MR, minADE, minFDE, brier_minFDE, AvgMinADE, ActorMR, AvgMinFDE, AvgBrierMinFDE
 from src.utils.optim import WarmupCosLR
+from src.model.drifttraj import (
+    drifting_loss,
+    endpoint_diversity_loss,
+    select_winner,
+    split_winner_and_others,
+)
+from src.model.drifttraj.utils import assert_finite_tensor, scheduled_weight
+
+try:
+    from pytorch_lightning.utilities.rank_zero import rank_zero_warn
+except ImportError:
+    def rank_zero_warn(message):
+        print(f"WARNING: {message}")
 
 
 class BaseLightningModule(pl.LightningModule):
@@ -117,23 +130,53 @@ class BaseLightningModule(pl.LightningModule):
         if ma: return self.ma_cal_loss(out, data, tag=tag)
         gt_len = data['target'][:, 0].shape[-2] # int((11 - data['timestamp'][0]).item() * 10)
         y_hat, pi, y_hat_others = out['y_hat'][:, :, :gt_len], out['pi'], out['y_hat_others'][:, :, :gt_len]
+        assert_finite_tensor("y_hat", y_hat)
+        assert_finite_tensor("pi", pi)
         new_y_hat = out.get('y_hat_single', None)
         if new_y_hat is not None: new_y_hat = new_y_hat[:, :, :gt_len]
         new_pi = out.get('pi_single', None)
         y, y_others = data['target'][:, 0], data['target'][:, 1:]
 
-        l2_norm = torch.norm(y_hat[..., :2] - y.unsqueeze(1), dim=-1).sum(dim=-1)        
-        best_mode = torch.argmin(l2_norm, dim=-1)
+        use_drift_loss = bool(getattr(self.model, 'use_drift_loss', False))
+        use_mdf = bool(getattr(self.model, 'use_mdf', False))
+        use_endpoint_diversity = bool(getattr(self.model, 'use_endpoint_diversity', False))
+        extra_training_loss_active = use_drift_loss or use_endpoint_diversity
+        if use_mdf and not use_drift_loss:
+            rank_zero_warn('use_mdf=True has no effect when use_drift_loss=False')
+
+        if extra_training_loss_active:
+            best_mode = select_winner(
+                y_hat[..., :2],
+                y,
+                metric=getattr(self.model, 'winner_metric', 'ade_fde'),
+                fde_weight=getattr(self.model, 'winner_fde_weight', 1.0),
+            )
+        else:
+            l2_norm = torch.norm(y_hat[..., :2] - y.unsqueeze(1), dim=-1).sum(dim=-1)
+            best_mode = torch.argmin(l2_norm, dim=-1)
         y_hat_best = y_hat[torch.arange(y_hat.shape[0]), best_mode]
         agent_reg_loss = F.smooth_l1_loss(y_hat_best[..., :2], y)
-        agent_cls_loss = F.cross_entropy(pi, best_mode.detach())
+        label_smoothing = (
+            getattr(self.model, 'label_smoothing', 0.0)
+            if getattr(self.model, 'use_label_smoothing_ce', False) and extra_training_loss_active
+            else 0.0
+        )
+        agent_cls_loss = F.cross_entropy(pi, best_mode.detach(), label_smoothing=label_smoothing)
 
         if new_y_hat is not None:
-            l2_norm = torch.norm(new_y_hat[..., :2] - y.unsqueeze(1), dim=-1).sum(dim=-1)
-            best_mode = torch.argmin(l2_norm, dim=-1)
-            new_y_hat_best = new_y_hat[torch.arange(new_y_hat.shape[0]), best_mode]
+            if getattr(self.model, 'drift_apply_to_single', False) and extra_training_loss_active:
+                new_best_mode = select_winner(
+                    new_y_hat[..., :2],
+                    y,
+                    metric=getattr(self.model, 'winner_metric', 'ade_fde'),
+                    fde_weight=getattr(self.model, 'winner_fde_weight', 1.0),
+                )
+            else:
+                l2_norm = torch.norm(new_y_hat[..., :2] - y.unsqueeze(1), dim=-1).sum(dim=-1)
+                new_best_mode = torch.argmin(l2_norm, dim=-1)
+            new_y_hat_best = new_y_hat[torch.arange(new_y_hat.shape[0]), new_best_mode]
             new_agent_reg_loss = F.smooth_l1_loss(new_y_hat_best[..., :2], y)
-            new_agent_cls_loss = F.cross_entropy(new_pi, best_mode.detach())
+            new_agent_cls_loss = F.cross_entropy(new_pi, new_best_mode.detach(), label_smoothing=label_smoothing)
         else:
             new_agent_reg_loss = 0
             new_agent_cls_loss = 0
@@ -143,13 +186,75 @@ class BaseLightningModule(pl.LightningModule):
             y_hat_others[others_reg_mask], y_others[others_reg_mask]
         )
 
-        loss = agent_reg_loss + agent_cls_loss + others_reg_loss + new_agent_reg_loss + new_agent_cls_loss
+        extra_loss = y_hat.new_zeros(())
+        extra_disp_dict = {}
+        current_epoch = int(getattr(self, 'current_epoch', 0))
+        use_loss_weight_schedule = bool(getattr(self.model, 'use_loss_weight_schedule', True))
+        if use_drift_loss:
+            winner, others = split_winner_and_others(y_hat[..., :2], best_mode)
+            radii = getattr(self.model, 'mdf_r_list', [0.1]) if use_mdf else [getattr(self.model, 'drift_single_radius', 0.1)]
+            drift_loss_value, drift_stats = drifting_loss(
+                gen=winner,
+                fixed_pos=y,
+                fixed_neg=others,
+                r_list=radii,
+                use_mdf=use_mdf,
+                include_old_gen_as_neg=getattr(self.model, 'mdf_include_old_gen_as_neg', True),
+                normalize_force=getattr(self.model, 'mdf_normalize_force', True),
+                pos_weight=getattr(self.model, 'mdf_positive_weight', 1.0),
+                neg_weight=getattr(self.model, 'mdf_negative_weight', 1.0),
+                force_clip=getattr(self.model, 'drift_force_clip', 1.0),
+                detach_target=getattr(self.model, 'drift_detach_target', True),
+                space=getattr(self.model, 'drift_space', 'traj'),
+                normalize_space=getattr(self.model, 'drift_normalize_space', True),
+            )
+            drift_base_w = getattr(self.model, 'drift_weight', 0.0)
+            drift_w = (
+                scheduled_weight(drift_base_w, current_epoch, getattr(self.model, 'drift_warmup_epochs', 0))
+                if use_loss_weight_schedule
+                else float(drift_base_w)
+            )
+            extra_loss = extra_loss + drift_w * drift_loss_value
+            extra_disp_dict.update({
+                f'{tag}drift_loss': drift_loss_value.item(),
+                f'{tag}drift_weight': drift_w,
+                f'{tag}drift_force_norm': drift_stats['force_norm'].item(),
+                f'{tag}drift_pos_aff': drift_stats['pos_aff'].item(),
+                f'{tag}drift_neg_aff': drift_stats['neg_aff'].item(),
+            })
+
+        if use_endpoint_diversity:
+            diversity_loss = endpoint_diversity_loss(
+                y_hat[..., :2],
+                sigma=getattr(self.model, 'diversity_sigma', 2.0),
+            )
+            diversity_base_w = getattr(self.model, 'diversity_weight', 0.0)
+            diversity_w = (
+                scheduled_weight(diversity_base_w, current_epoch, getattr(self.model, 'diversity_warmup_epochs', 0))
+                if use_loss_weight_schedule
+                else float(diversity_base_w)
+            )
+            extra_loss = extra_loss + diversity_w * diversity_loss
+            extra_disp_dict.update({
+                f'{tag}diversity_loss': diversity_loss.item(),
+                f'{tag}diversity_weight': diversity_w,
+            })
+
+        loss = agent_reg_loss + agent_cls_loss + others_reg_loss + new_agent_reg_loss + new_agent_cls_loss + extra_loss
+        assert_finite_tensor("loss", loss)
         disp_dict = {
             f'{tag}loss': loss.item(),
             f'{tag}reg_loss': agent_reg_loss.item(),
             f'{tag}cls_loss': agent_cls_loss.item(),
             f'{tag}others_reg_loss': others_reg_loss.item(),
         }
+        if 'gmp_comp_idx' in out:
+            comp_idx = out['gmp_comp_idx']
+            counts = torch.bincount(comp_idx.reshape(-1), minlength=int(comp_idx.max().item()) + 1).float()
+            probs = counts / counts.sum().clamp_min(1)
+            entropy = -(probs * probs.clamp_min(1e-8).log()).sum()
+            disp_dict[f'{tag}gmp_component_entropy'] = entropy.item()
+        disp_dict.update(extra_disp_dict)
 
         return loss, disp_dict
 

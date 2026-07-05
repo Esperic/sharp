@@ -9,12 +9,23 @@ from .custom_transformer_blocks import Block
 
 
 class MultimodalDecoder(nn.Module):
-    def __init__(self, use_target_context, embed_dim=128, future_steps=60, k=6, ma=False) -> None:
+    def __init__(
+        self,
+        use_target_context,
+        embed_dim=128,
+        future_steps=60,
+        k=6,
+        ma=False,
+        use_gmp=False,
+        gmp_prior_logit_bias_weight=0.05,
+    ) -> None:
         super().__init__()
 
         self.embed_dim = embed_dim
         self.future_steps = future_steps
         self.k = k
+        self.use_gmp = use_gmp
+        self.gmp_prior_logit_bias_weight = float(gmp_prior_logit_bias_weight)
 
         self.attn_depth = 3
         dpr = [x.item() for x in torch.linspace(0, 0.2, self.attn_depth)]
@@ -89,7 +100,18 @@ class MultimodalDecoder(nn.Module):
         return
 
 
-    def forward(self, x, x_encoder, key_padding_mask, N, aux):
+    def _apply_gmp_query_delta(self, intention_query, gmp_aux):
+        if self.use_gmp and gmp_aux is not None and gmp_aux.get("query_delta") is not None:
+            query_delta = gmp_aux["query_delta"]
+            if query_delta.shape != intention_query.shape:
+                raise RuntimeError(
+                    f"GMP query_delta shape {tuple(query_delta.shape)} does not match "
+                    f"decoder query shape {tuple(intention_query.shape)}"
+                )
+            intention_query = intention_query + query_delta
+        return intention_query
+
+    def forward(self, x, x_encoder, key_padding_mask, N, aux, gmp_aux=None):
         B = x.shape[0]
 
         kv = x_encoder
@@ -101,6 +123,7 @@ class MultimodalDecoder(nn.Module):
             old_modes = self.mode_embed.weight.view(1, self.k, self.embed_dim).repeat(B, 1, 1)
             intention_query = self.new_mode_embed.weight.view(1, self.k, self.embed_dim).repeat(B, 1, 1)
             intention_query[first_indices] = old_modes[first_indices]
+            intention_query = self._apply_gmp_query_delta(intention_query, gmp_aux)
 
             for ali in range(self.attn_depth):
                 intention_query = self.lane_blks[ali](intention_query, k=kv_ctx, v=kv_ctx, key_padding_mask=mask_ctx)
@@ -112,6 +135,7 @@ class MultimodalDecoder(nn.Module):
                     intention_query = intention_query.view(B, self.k, self.embed_dim) 
         else: 
             intention_query = self.mode_embed.weight.view(1, self.k, self.embed_dim).repeat(B, 1, 1)
+            intention_query = self._apply_gmp_query_delta(intention_query, gmp_aux)
             for ali in range(self.attn_depth):
                 intention_query = self.lane_blks[ali](intention_query, k=kv_ctx, v=kv_ctx, key_padding_mask=mask_ctx)
                 if len(aux) > 3:
@@ -123,7 +147,17 @@ class MultimodalDecoder(nn.Module):
 
         loc = self.loc(intention_query).view(B, self.k, self.future_steps, 2)
         pi = self.pi(intention_query).squeeze(2)
+        if self.use_gmp and gmp_aux is not None and gmp_aux.get("pi_bias") is not None:
+            pi_bias = gmp_aux["pi_bias"]
+            if pi_bias.shape != pi.shape:
+                raise RuntimeError(
+                    f"GMP pi_bias shape {tuple(pi_bias.shape)} does not match pi shape {tuple(pi.shape)}"
+                )
+            pi = pi + self.gmp_prior_logit_bias_weight * pi_bias
         head = torch.zeros_like(loc)
         loc = torch.cat([loc, head], dim=-1)
 
-        return loc, pi, [intention_query, self.mode_embed.weight.view(1, self.k, self.embed_dim).repeat(B, 1, 1).detach()]
+        aux_ret = [intention_query, self.mode_embed.weight.view(1, self.k, self.embed_dim).repeat(B, 1, 1).detach()]
+        if self.use_gmp and gmp_aux is not None:
+            aux_ret.append(gmp_aux.get("comp_idx"))
+        return loc, pi, aux_ret

@@ -19,6 +19,45 @@ pl_module:
     biased_interaction: True
     dm: nus
     k: 5
+    use_gmp: false
+    use_drift_loss: false
+    use_mdf: false
+    gmp_path:
+    gmp_k: ${model.pl_module.model.k}
+    gmp_std_floor: 0.05
+    gmp_sampling: query_aligned
+    gmp_train_noise_scale: 1.0
+    gmp_eval_noise_scale: 0.0
+    gmp_use_center_points: true
+    gmp_use_cluster_trajs_for_init: true
+    gmp_condition_query: true
+    gmp_condition_pi: true
+    gmp_condition_memory: false
+    use_gmp_prior_logit_bias: true
+    gmp_prior_logit_bias_weight: 0.05
+    use_endpoint_diversity: true
+    drift_weight: 0.2
+    drift_warmup_epochs: 5
+    drift_space: traj
+    drift_detach_target: true
+    drift_single_radius: 0.1
+    drift_force_clip: 1.0
+    drift_loss_type: mse
+    drift_normalize_space: true
+    drift_apply_to_single: false
+    winner_metric: ade_fde
+    winner_fde_weight: 1.0
+    mdf_r_list: [0.02, 0.1, 0.5]
+    mdf_normalize_force: true
+    mdf_positive_weight: 1.0
+    mdf_negative_weight: 1.0
+    mdf_include_old_gen_as_neg: true
+    diversity_weight: 0.05
+    diversity_sigma: 2.0
+    diversity_warmup_epochs: 3
+    use_label_smoothing_ce: true
+    label_smoothing: 0.05
+    use_loss_weight_schedule: true
   optim:
     lr: 1e-3
     weight_decay: 1e-2
