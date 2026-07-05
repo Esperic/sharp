@@ -54,15 +54,34 @@ def _dataset_for(dataset, root, future_steps):
     if dataset == "av2":
         from src.datamodules.av2_dataset import Av2Dataset
 
-        return Av2Dataset(data_root=data_root, split=split, num_future_steps=future_steps, randomize=False)
+        return Av2Dataset(
+            data_root=data_root,
+            split=split,
+            num_historical_steps=10,
+            split_points=[10, 20, 30, 40, 50],
+            num_future_steps=future_steps,
+            randomize=False,
+        )
     if dataset == "av1":
         from src.datamodules.av1_dataset import Av1Dataset
 
-        return Av1Dataset(data_root=data_root, split=split, num_future_steps=future_steps)
+        return Av1Dataset(
+            data_root=data_root,
+            split=split,
+            num_historical_steps=20,
+            split_points=[5, 10, 15, 20],
+            num_future_steps=future_steps,
+        )
     if dataset in {"nus", "nuscenes"}:
         from src.datamodules.nus_dataset import NusDataset
 
-        return NusDataset(data_root=data_root, split=split, num_future_steps=future_steps)
+        return NusDataset(
+            data_root=data_root,
+            split=split,
+            num_historical_steps=5,
+            split_points=[4, 5],
+            num_future_steps=future_steps,
+        )
     raise ValueError(f"Unsupported dataset={dataset}")
 
 
