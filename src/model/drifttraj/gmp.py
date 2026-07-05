@@ -95,6 +95,7 @@ class GaussianMixturePrior(nn.Module):
             nn.Linear(embed_dim, 2 * embed_dim),
         )
         self._init_conditioners()
+        self._freeze_disabled_conditioners()
 
     def _init_conditioners(self) -> None:
         for module in (self.gmp_query_proj, self.gmp_pi_proj, self.gmp_memory_film):
@@ -105,6 +106,16 @@ class GaussianMixturePrior(nn.Module):
             last = module[-1]
             nn.init.zeros_(last.weight)
             nn.init.zeros_(last.bias)
+
+    @staticmethod
+    def _set_trainable(module: nn.Module, trainable: bool) -> None:
+        for param in module.parameters():
+            param.requires_grad = trainable
+
+    def _freeze_disabled_conditioners(self) -> None:
+        self._set_trainable(self.gmp_query_proj, self.condition_query)
+        self._set_trainable(self.gmp_pi_proj, self.condition_pi)
+        self._set_trainable(self.gmp_memory_film, self.condition_memory)
 
     def _component_indices(self, batch_size: int, num_queries: int, device: torch.device) -> torch.Tensor:
         if self.sampling == "random" and self.training:

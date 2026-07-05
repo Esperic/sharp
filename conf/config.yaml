@@ -18,6 +18,7 @@ gpus: 1
 batch_size: 32
 epochs: 60
 checkpoint:
+pretrained_checkpoint:
 submit:
 wandb: disabled
 wandb_project: sharp
@@ -45,4 +46,3 @@ trainer:
   gradient_clip_algorithm: norm
   sync_batchnorm: true
   default_root_dir: ${output_dir}
-

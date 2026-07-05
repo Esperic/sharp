@@ -3,7 +3,8 @@ import hydra
 import pytorch_lightning as pl
 from hydra.utils import instantiate
 from pytorch_lightning.loggers import WandbLogger
-import os
+from pytorch_lightning.utilities.rank_zero import rank_zero_only
+import shutil
 
 logger = logging.getLogger(__name__)
 
@@ -23,17 +24,35 @@ def build_wandb_logger(cfg):
     )
 
 
+@rank_zero_only
+def archive_model_source(output_dir):
+    shutil.copytree("src/model", f"{output_dir}/model", dirs_exist_ok=True)
+
+
+def load_pretrained_weights(model, ckpt_path):
+    if not ckpt_path:
+        return
+    logger.info(f"Warm-starting model weights from {ckpt_path}")
+    incompatible = model.load_chkpt(ckpt_path)
+    if incompatible is not None:
+        logger.info(f"Missing keys while loading pretrained weights: {incompatible.missing_keys}")
+        logger.info(f"Unexpected keys while loading pretrained weights: {incompatible.unexpected_keys}")
+
+
 @hydra.main(version_base=None, config_path="conf", config_name="config")
 def main(cfg):
     output_dir = cfg.output_dir
     logger.info(f"Experiments are stored in {output_dir}")
     pl.seed_everything(cfg.seed, workers=True)
     logger.info(f"Global Seed set to {cfg.seed}")
+    if getattr(cfg, "checkpoint", None) and getattr(cfg, "pretrained_checkpoint", None):
+        raise ValueError("Use checkpoint for resume or pretrained_checkpoint for warm-start, not both.")
 
     datamodule = instantiate(cfg.datamodule.pl_module, logger=logger)
 
     model = instantiate(cfg.model.pl_module)
-    os.system('cp -a %s %s' % ('src/model', output_dir))
+    load_pretrained_weights(model, getattr(cfg, "pretrained_checkpoint", None))
+    archive_model_source(output_dir)
     logger.info(model)
 
     callbacks = instantiate(cfg.callbacks)

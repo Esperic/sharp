@@ -57,12 +57,13 @@ class BaseLightningModule(pl.LightningModule):
         state_dict = {
             k[len("model.") :]: v for k, v in ckpt.items() if k.startswith("model.")
         }
-        self.model.load_state_dict(state_dict=state_dict, strict=False)
+        incompatible = self.model.load_state_dict(state_dict=state_dict, strict=False)
         if multi:
             state_dict = {
                 k[len("consitency_module.") :]: v for k, v in ckpt.items() if k.startswith("consitency_module.")
             }
             self.consitency_module.load_state_dict(state_dict=state_dict, strict=False)
+        return incompatible
 
     """
         Reset the custom metrics before each evaluation run.
@@ -359,6 +360,8 @@ class BaseLightningModule(pl.LightningModule):
         )
         for module_name, module in self.named_modules():
             for param_name, param in module.named_parameters():
+                if not param.requires_grad:
+                    continue
                 full_param_name = (
                     '%s.%s' % (module_name, param_name) if module_name else param_name
                 )
@@ -372,7 +375,7 @@ class BaseLightningModule(pl.LightningModule):
                 elif not ('weight' in param_name or 'bias' in param_name):
                     no_decay.add(full_param_name)
         param_dict = {
-            param_name: param for param_name, param in self.named_parameters()
+            param_name: param for param_name, param in self.named_parameters() if param.requires_grad
         }
         inter_params = decay & no_decay
         union_params = decay | no_decay
