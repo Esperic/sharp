@@ -149,7 +149,7 @@ class BaseLightningModule(pl.LightningModule):
             best_mode = select_winner(
                 y_hat[..., :2],
                 y,
-                metric=getattr(self.model, 'winner_metric', 'ade_fde'),
+                metric=getattr(self.model, 'winner_metric', 'l2_sum'),
                 fde_weight=getattr(self.model, 'winner_fde_weight', 1.0),
             )
         else:
@@ -169,7 +169,7 @@ class BaseLightningModule(pl.LightningModule):
                 new_best_mode = select_winner(
                     new_y_hat[..., :2],
                     y,
-                    metric=getattr(self.model, 'winner_metric', 'ade_fde'),
+                    metric=getattr(self.model, 'winner_metric', 'l2_sum'),
                     fde_weight=getattr(self.model, 'winner_fde_weight', 1.0),
                 )
             else:
@@ -208,6 +208,7 @@ class BaseLightningModule(pl.LightningModule):
                 detach_target=getattr(self.model, 'drift_detach_target', True),
                 space=getattr(self.model, 'drift_space', 'traj'),
                 normalize_space=getattr(self.model, 'drift_normalize_space', True),
+                loss_type=getattr(self.model, 'drift_loss_type', 'official'),
             )
             drift_base_w = getattr(self.model, 'drift_weight', 0.0)
             drift_w = (

@@ -30,6 +30,7 @@ class GaussianMixturePrior(nn.Module):
         condition_pi: bool = True,
         condition_memory: bool = False,
         use_prior_logit_bias: bool = True,
+        latent_dim: int = 16,
     ) -> None:
         super().__init__()
         if path is None:
@@ -61,6 +62,7 @@ class GaussianMixturePrior(nn.Module):
         self.k = int(k)
         self.gmp_k = int(center_points.shape[0])
         self.embed_dim = int(embed_dim)
+        self.latent_dim = int(latent_dim)
         self.sampling = sampling
         self.train_noise_scale = float(train_noise_scale)
         self.eval_noise_scale = float(eval_noise_scale)
@@ -79,33 +81,26 @@ class GaussianMixturePrior(nn.Module):
         self.register_buffer("center_std", center_std, persistent=True)
         self.register_buffer("mixture_weights", mixture_weights, persistent=True)
 
-        self.gmp_query_proj = nn.Sequential(
-            nn.Linear(2, embed_dim),
-            nn.GELU(),
-            nn.Linear(embed_dim, embed_dim),
-        )
+        self.gmp_xy_to_latent = nn.Linear(2, self.latent_dim)
+        self.gmp_query_proj = nn.Linear(self.latent_dim, embed_dim)
         self.gmp_pi_proj = nn.Sequential(
-            nn.Linear(2, embed_dim),
+            nn.Linear(self.latent_dim, embed_dim),
             nn.GELU(),
             nn.Linear(embed_dim, 1),
         )
-        self.gmp_memory_film = nn.Sequential(
-            nn.Linear(2, embed_dim),
-            nn.GELU(),
-            nn.Linear(embed_dim, 2 * embed_dim),
-        )
+        self.gmp_memory_norm = nn.LayerNorm(embed_dim)
+        self.gmp_memory_film = nn.Linear(self.latent_dim, 2 * embed_dim)
         self._init_conditioners()
         self._freeze_disabled_conditioners()
 
     def _init_conditioners(self) -> None:
-        for module in (self.gmp_query_proj, self.gmp_pi_proj, self.gmp_memory_film):
-            for layer in module:
+        for module in (self.gmp_xy_to_latent, self.gmp_query_proj, self.gmp_pi_proj, self.gmp_memory_film):
+            for layer in module.modules():
                 if isinstance(layer, nn.Linear):
                     nn.init.xavier_uniform_(layer.weight)
                     nn.init.zeros_(layer.bias)
-            last = module[-1]
-            nn.init.zeros_(last.weight)
-            nn.init.zeros_(last.bias)
+        nn.init.ones_(self.gmp_memory_norm.weight)
+        nn.init.zeros_(self.gmp_memory_norm.bias)
 
     @staticmethod
     def _set_trainable(module: nn.Module, trainable: bool) -> None:
@@ -113,9 +108,12 @@ class GaussianMixturePrior(nn.Module):
             param.requires_grad = trainable
 
     def _freeze_disabled_conditioners(self) -> None:
+        uses_latent = self.condition_query or self.condition_pi or self.condition_memory
+        self._set_trainable(self.gmp_xy_to_latent, uses_latent)
         self._set_trainable(self.gmp_query_proj, self.condition_query)
         self._set_trainable(self.gmp_pi_proj, self.condition_pi)
         self._set_trainable(self.gmp_memory_film, self.condition_memory)
+        self._set_trainable(self.gmp_memory_norm, self.condition_memory)
 
     def _component_indices(self, batch_size: int, num_queries: int, device: torch.device) -> torch.Tensor:
         if self.sampling == "random" and self.training:
@@ -159,24 +157,30 @@ class GaussianMixturePrior(nn.Module):
             return xy.new_zeros(*xy.shape[:-1], self.embed_dim)
         if xy.shape[-1] != 2:
             raise ValueError(f"GMP xy must end in 2, got {tuple(xy.shape)}")
-        return self.gmp_query_proj(xy)
+        return self.gmp_query_proj(self.xy_to_latent(xy))
 
     def xy_to_pi_bias(self, xy: torch.Tensor, comp_idx: Optional[torch.Tensor] = None) -> Optional[torch.Tensor]:
         if not self.condition_pi:
             return None
-        bias = self.gmp_pi_proj(xy).squeeze(-1)
+        bias = self.gmp_pi_proj(self.xy_to_latent(xy)).squeeze(-1)
         if self.use_prior_logit_bias and comp_idx is not None:
             log_w = torch.log(self.mixture_weights.to(xy.device).clamp_min(1e-8))
             bias = bias + log_w[comp_idx]
         return bias
 
+    def xy_to_latent(self, xy: torch.Tensor) -> torch.Tensor:
+        if xy.shape[-1] != 2:
+            raise ValueError(f"GMP xy must end in 2, got {tuple(xy.shape)}")
+        return self.gmp_xy_to_latent(xy)
+
     def memory_film(self, x_encoder: torch.Tensor, xy: torch.Tensor) -> torch.Tensor:
         if not self.condition_memory:
             return x_encoder
-        pooled_xy = xy.mean(dim=1)
-        gamma_beta = self.gmp_memory_film(pooled_xy).unsqueeze(1)
+        pooled_z = self.xy_to_latent(xy).mean(dim=1)
+        gamma_beta = self.gmp_memory_film(pooled_z).unsqueeze(1)
         gamma, beta = gamma_beta.chunk(2, dim=-1)
-        return x_encoder * (1.0 + 0.01 * torch.tanh(gamma)) + 0.01 * beta
+        x_encoder = self.gmp_memory_norm(x_encoder)
+        return x_encoder * (1.0 + gamma) + beta
 
     def component_entropy(self, comp_idx: torch.Tensor) -> torch.Tensor:
         counts = torch.bincount(comp_idx.reshape(-1), minlength=self.gmp_k).float()

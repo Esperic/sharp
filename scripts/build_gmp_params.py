@@ -274,46 +274,61 @@ def _fit_kmeans(flat, k, seed):
 def build_gmp(trajs, k, std_floor, seed, normalize):
     if trajs.ndim != 3 or trajs.shape[-1] != 2:
         raise ValueError(f"Expected trajectories [N,T,2], got {trajs.shape}")
-    flat = trajs.reshape(trajs.shape[0], -1)
     norm_meta = {"type": normalize}
     if normalize == "mean_range":
-        mean = flat.mean(axis=0, keepdims=True)
-        scale = np.maximum(np.ptp(flat, axis=0, keepdims=True), 1e-6)
-        flat_for_cluster = (flat - mean) / scale
-        norm_meta["mean"] = mean.reshape(-1).tolist()
-        norm_meta["scale"] = scale.reshape(-1).tolist()
+        points = trajs.reshape(-1, 2)
+        mean = points.mean(axis=0).astype(np.float32)
+        scale = np.maximum(np.ptp(points, axis=0), 1e-6).astype(np.float32)
+        trajs_for_cluster = ((trajs - mean.reshape(1, 1, 2)) / scale.reshape(1, 1, 2)).astype(np.float32)
+        flat_for_cluster = trajs_for_cluster.reshape(trajs.shape[0], -1)
+        norm_meta["mean"] = mean.tolist()
+        norm_meta["scale"] = scale.tolist()
     elif normalize == "none":
-        flat_for_cluster = flat
+        trajs_for_cluster = trajs
+        flat_for_cluster = trajs.reshape(trajs.shape[0], -1)
     else:
         raise ValueError("normalize must be one of: none, mean_range")
 
     labels = _fit_kmeans(flat_for_cluster, k, seed)
     cluster_trajs = np.zeros((k, trajs.shape[1], 2), dtype=np.float32)
+    cluster_trajs_raw = np.zeros((k, trajs.shape[1], 2), dtype=np.float32)
     center_points = np.zeros((k, 2), dtype=np.float32)
+    center_points_raw = np.zeros((k, 2), dtype=np.float32)
     center_std = np.zeros((k, 2), dtype=np.float32)
+    center_std_raw = np.zeros((k, 2), dtype=np.float32)
     mixture_weights = np.zeros(k, dtype=np.float32)
     counts = np.zeros(k, dtype=np.int64)
 
     for comp in range(k):
-        member = trajs[labels == comp]
+        member = trajs_for_cluster[labels == comp]
+        member_raw = trajs[labels == comp]
         if member.shape[0] == 0:
-            member = trajs[[np.random.default_rng(seed + comp).integers(0, trajs.shape[0])]]
+            fallback = np.random.default_rng(seed + comp).integers(0, trajs.shape[0])
+            member = trajs_for_cluster[[fallback]]
+            member_raw = trajs[[fallback]]
         counts[comp] = member.shape[0]
         cluster_trajs[comp] = member.mean(axis=0)
+        cluster_trajs_raw[comp] = member_raw.mean(axis=0)
         points = member.reshape(-1, 2)
+        points_raw = member_raw.reshape(-1, 2)
         center_points[comp] = points.mean(axis=0)
         center_std[comp] = np.maximum(points.std(axis=0), std_floor)
+        center_points_raw[comp] = points_raw.mean(axis=0)
+        center_std_raw[comp] = np.maximum(points_raw.std(axis=0), std_floor)
         mixture_weights[comp] = float(member.shape[0]) / float(trajs.shape[0])
 
-    endpoints = cluster_trajs[:, -1]
+    endpoints = cluster_trajs_raw[:, -1] if normalize == "mean_range" else cluster_trajs[:, -1]
     angles = np.arctan2(endpoints[:, 1], endpoints[:, 0])
     distances = np.linalg.norm(endpoints, axis=-1)
     order = np.lexsort((-counts, distances, angles))
     return {
         "center_points": center_points[order].astype(np.float32),
         "center_std": center_std[order].astype(np.float32),
+        "center_points_raw": center_points_raw[order].astype(np.float32),
+        "center_std_raw": center_std_raw[order].astype(np.float32),
         "mixture_weights": mixture_weights[order].astype(np.float32),
         "cluster_trajs": cluster_trajs[order].astype(np.float32),
+        "cluster_trajs_raw": cluster_trajs_raw[order].astype(np.float32),
         "counts": counts[order],
         "endpoint_order": endpoints[order],
         "normalization": norm_meta,
@@ -371,8 +386,11 @@ def main():
         output,
         center_points=params["center_points"],
         center_std=params["center_std"],
+        center_points_raw=params["center_points_raw"],
+        center_std_raw=params["center_std_raw"],
         mixture_weights=params["mixture_weights"],
         cluster_trajs=params["cluster_trajs"],
+        cluster_trajs_raw=params["cluster_trajs_raw"],
         metadata=json.dumps(metadata),
     )
     sidecar = output.with_suffix(".json")

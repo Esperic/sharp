@@ -31,7 +31,9 @@ def select_winner(
     dist = torch.norm(y_hat[..., :2] - y.unsqueeze(1), dim=-1)
     ade = dist.mean(dim=-1)
     fde = torch.norm(y_hat[:, :, -1, :2] - y[:, -1].unsqueeze(1), dim=-1)
-    if metric == "ade":
+    if metric == "l2_sum":
+        score = dist.sum(dim=-1)
+    elif metric == "ade":
         score = ade
     elif metric == "fde":
         score = fde
@@ -80,6 +82,92 @@ def _safe_force(vec: torch.Tensor, aff: torch.Tensor, normalize_force: bool) -> 
     return force
 
 
+def _batched_cdist(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    xy_dot = torch.einsum("bns,bms->bnm", x, y)
+    x_norm = x.square().sum(dim=-1, keepdim=True)
+    y_norm = y.square().sum(dim=-1, keepdim=True).transpose(1, 2)
+    sq_dist = (x_norm + y_norm - 2.0 * xy_dot).clamp_min(0.0)
+    return (sq_dist + eps).sqrt()
+
+
+def _official_drifting_loss(
+    gen: torch.Tensor,
+    fixed_pos: torch.Tensor,
+    fixed_neg: torch.Tensor = None,
+    r_list: Iterable[float] = (0.02, 0.1, 0.5),
+    space: str = "traj",
+    normalize_space: bool = False,
+    eps: float = 1e-8,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    gen_flat = flatten_trajectories(gen, space=space, normalize_space=normalize_space).unsqueeze(1)
+    pos_flat = flatten_trajectories(fixed_pos.detach(), space=space, normalize_space=normalize_space).unsqueeze(1)
+    if fixed_neg is None or fixed_neg.numel() == 0:
+        neg_flat = gen_flat[:, :0].detach()
+    else:
+        neg_flat = flatten_trajectories(fixed_neg.detach(), space=space, normalize_space=normalize_space)
+
+    old_gen = gen_flat.detach()
+    targets = torch.cat([old_gen, neg_flat, pos_flat], dim=1)
+    weight_gen = torch.ones(*old_gen.shape[:2], device=gen.device, dtype=gen.dtype)
+    weight_neg = torch.ones(*neg_flat.shape[:2], device=gen.device, dtype=gen.dtype)
+    weight_pos = torch.ones(*pos_flat.shape[:2], device=gen.device, dtype=gen.dtype)
+    targets_w = torch.cat([weight_gen, weight_neg, weight_pos], dim=1)
+
+    radii = tuple(float(r) for r in r_list)
+    if not radii or min(radii) <= 0:
+        raise ValueError(f"r_list must contain positive radii, got {radii}")
+
+    with torch.no_grad():
+        dist = _batched_cdist(old_gen, targets, eps=eps)
+        weighted_dist = dist * targets_w[:, None, :]
+        scale = (weighted_dist.mean() / targets_w.mean().clamp_min(eps)).clamp_min(1e-3)
+        scale_inputs = (scale / (gen_flat.shape[-1] ** 0.5)).clamp_min(1e-3)
+
+        old_gen_scaled = old_gen / scale_inputs
+        targets_scaled = targets / scale_inputs
+        dist_normed = dist / scale.clamp_min(1e-3)
+
+        self_mask = torch.eye(old_gen.shape[1], device=gen.device, dtype=gen.dtype)[None] * 100.0
+        dist_normed[:, :, :old_gen.shape[1]] = dist_normed[:, :, :old_gen.shape[1]] + self_mask
+
+        total_force = torch.zeros_like(old_gen_scaled)
+        split_idx = old_gen.shape[1] + neg_flat.shape[1]
+        stats = {"scale": scale.detach()}
+        for radius in radii:
+            logits = -dist_normed / radius
+            affinity = torch.softmax(logits, dim=-1)
+            affinity_t = torch.softmax(logits, dim=-2)
+            affinity = torch.sqrt((affinity * affinity_t).clamp_min(1e-8))
+            affinity = affinity * targets_w[:, None, :]
+
+            aff_neg = affinity[:, :, :split_idx]
+            aff_pos = affinity[:, :, split_idx:]
+
+            sum_pos = aff_pos.sum(dim=-1, keepdim=True)
+            coeff_neg = -aff_neg * sum_pos
+            sum_neg = aff_neg.sum(dim=-1, keepdim=True)
+            coeff_pos = aff_pos * sum_neg
+
+            coeff = torch.cat([coeff_neg, coeff_pos], dim=-1)
+            force = torch.matmul(coeff, targets_scaled)
+            coeff_sum = coeff.sum(dim=-1, keepdim=True)
+            force = force - coeff_sum * old_gen_scaled
+            force_norm = force.square().mean().clamp_min(eps).sqrt()
+            total_force = total_force + force / force_norm
+            stats[f"loss_R_{radius:g}"] = force_norm.detach()
+
+        goal_scaled = (old_gen_scaled + total_force).detach()
+
+    gen_scaled = gen_flat / scale_inputs
+    loss = F.mse_loss(gen_scaled, goal_scaled)
+    if not torch.isfinite(loss):
+        raise FloatingPointError("official drifting_loss produced NaN or Inf")
+    stats["force_norm"] = total_force.norm(dim=-1).mean().detach()
+    stats["pos_aff"] = gen.new_zeros(())
+    stats["neg_aff"] = gen.new_zeros(())
+    return loss, stats
+
+
 def drifting_loss(
     gen: torch.Tensor,
     fixed_pos: torch.Tensor,
@@ -94,11 +182,24 @@ def drifting_loss(
     detach_target: bool = True,
     space: str = "traj",
     normalize_space: bool = True,
+    loss_type: str = "legacy",
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     if gen.shape != fixed_pos.shape:
         raise ValueError(f"gen and fixed_pos must match, got {tuple(gen.shape)} and {tuple(fixed_pos.shape)}")
     if not torch.isfinite(gen).all() or not torch.isfinite(fixed_pos).all():
         raise FloatingPointError("drifting_loss received non-finite gen or fixed_pos")
+
+    if loss_type in {"official", "method"}:
+        return _official_drifting_loss(
+            gen=gen,
+            fixed_pos=fixed_pos,
+            fixed_neg=fixed_neg,
+            r_list=r_list,
+            space=space,
+            normalize_space=False,
+        )
+    if loss_type != "legacy":
+        raise ValueError(f"Unsupported drift_loss_type={loss_type}")
 
     radii = tuple(float(r) for r in r_list)
     if not use_mdf:

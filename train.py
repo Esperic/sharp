@@ -3,8 +3,13 @@ import hydra
 import pytorch_lightning as pl
 from hydra.utils import instantiate
 from pytorch_lightning.loggers import WandbLogger
-from pytorch_lightning.utilities.rank_zero import rank_zero_only
 import shutil
+
+try:
+    from pytorch_lightning.utilities.rank_zero import rank_zero_only
+except ImportError:
+    def rank_zero_only(fn):
+        return fn
 
 logger = logging.getLogger(__name__)
 
