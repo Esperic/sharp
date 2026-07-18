@@ -46,6 +46,10 @@ pl_module:
     drift_loss_type: official
     drift_normalize_space: true
     drift_apply_to_single: false
+    drift_soft_tau: 0.05
+    drift_error_gate: 1.0
+    drift_protect_gt_direction: true
+    drift_final_step_only: true
     winner_metric: l2_sum
     winner_fde_weight: 1.0
     mdf_r_list: [0.02, 0.1, 0.5]
@@ -59,6 +63,8 @@ pl_module:
     use_label_smoothing_ce: false
     label_smoothing: 0.05
     use_loss_weight_schedule: true
+    auxiliary_decay_start_epoch:
+    auxiliary_decay_end_epoch:
   optim:
     lr: 1e-3
     weight_decay: 1e-2

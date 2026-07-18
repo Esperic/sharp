@@ -127,7 +127,7 @@ class BaseLightningModule(pl.LightningModule):
     """
         Compute loss (single-agent or multi-agent)
     """
-    def cal_loss(self, out, data, tag='', ma=False):
+    def cal_loss(self, out, data, tag='', ma=False, apply_drift_loss=True):
         if ma: return self.ma_cal_loss(out, data, tag=tag)
         gt_len = data['target'][:, 0].shape[-2] # int((11 - data['timestamp'][0]).item() * 10)
         y_hat, pi, y_hat_others = out['y_hat'][:, :, :gt_len], out['pi'], out['y_hat_others'][:, :, :gt_len]
@@ -138,11 +138,12 @@ class BaseLightningModule(pl.LightningModule):
         new_pi = out.get('pi_single', None)
         y, y_others = data['target'][:, 0], data['target'][:, 1:]
 
-        use_drift_loss = bool(getattr(self.model, 'use_drift_loss', False))
+        configured_use_drift_loss = bool(getattr(self.model, 'use_drift_loss', False))
+        use_drift_loss = configured_use_drift_loss and apply_drift_loss
         use_mdf = bool(getattr(self.model, 'use_mdf', False))
         use_endpoint_diversity = bool(getattr(self.model, 'use_endpoint_diversity', False))
         extra_training_loss_active = use_drift_loss or use_endpoint_diversity
-        if use_mdf and not use_drift_loss:
+        if use_mdf and not configured_use_drift_loss:
             rank_zero_warn('use_mdf=True has no effect when use_drift_loss=False')
 
         if extra_training_loss_active:
@@ -209,10 +210,19 @@ class BaseLightningModule(pl.LightningModule):
                 space=getattr(self.model, 'drift_space', 'traj'),
                 normalize_space=getattr(self.model, 'drift_normalize_space', True),
                 loss_type=getattr(self.model, 'drift_loss_type', 'official'),
+                soft_tau=getattr(self.model, 'drift_soft_tau', 0.05),
+                error_gate=getattr(self.model, 'drift_error_gate', 1.0),
+                protect_gt_direction=getattr(self.model, 'drift_protect_gt_direction', True),
             )
             drift_base_w = getattr(self.model, 'drift_weight', 0.0)
             drift_w = (
-                scheduled_weight(drift_base_w, current_epoch, getattr(self.model, 'drift_warmup_epochs', 0))
+                scheduled_weight(
+                    drift_base_w,
+                    current_epoch,
+                    getattr(self.model, 'drift_warmup_epochs', 0),
+                    getattr(self.model, 'auxiliary_decay_start_epoch', None),
+                    getattr(self.model, 'auxiliary_decay_end_epoch', None),
+                )
                 if use_loss_weight_schedule
                 else float(drift_base_w)
             )
@@ -221,6 +231,8 @@ class BaseLightningModule(pl.LightningModule):
                 f'{tag}drift_loss': drift_loss_value.item(),
                 f'{tag}drift_weight': drift_w,
                 f'{tag}drift_force_norm': drift_stats['force_norm'].item(),
+                f'{tag}drift_raw_force_norm': drift_stats.get('raw_force_norm', drift_stats['force_norm']).item(),
+                f'{tag}drift_scale': drift_stats.get('scale', y_hat.new_zeros(())).item(),
                 f'{tag}drift_pos_aff': drift_stats['pos_aff'].item(),
                 f'{tag}drift_neg_aff': drift_stats['neg_aff'].item(),
             })
@@ -232,7 +244,13 @@ class BaseLightningModule(pl.LightningModule):
             )
             diversity_base_w = getattr(self.model, 'diversity_weight', 0.0)
             diversity_w = (
-                scheduled_weight(diversity_base_w, current_epoch, getattr(self.model, 'diversity_warmup_epochs', 0))
+                scheduled_weight(
+                    diversity_base_w,
+                    current_epoch,
+                    getattr(self.model, 'diversity_warmup_epochs', 0),
+                    getattr(self.model, 'auxiliary_decay_start_epoch', None),
+                    getattr(self.model, 'auxiliary_decay_end_epoch', None),
+                )
                 if use_loss_weight_schedule
                 else float(diversity_base_w)
             )
@@ -291,7 +309,7 @@ class BaseLightningModule(pl.LightningModule):
 
         out = self(data)
 
-        _, loss_dict = self.cal_loss(out, data)
+        _, loss_dict = self.cal_loss(out, data, apply_drift_loss=False)
         if self.ma:
             metrics = self.metrics(out, data['target'], data["scored_mask"])
         else:
@@ -447,7 +465,16 @@ class StreamLightningModule(BaseLightningModule):
             cur_data = data[i + num_no_grad_frames]
             cur_data['memory_dict'] = memory_dict
             out = self(cur_data)
-            cur_loss, cur_loss_dict = self.cal_loss(out, cur_data, tag=f'step{i + num_no_grad_frames}_')
+            apply_drift_loss = (
+                not getattr(self.model, 'drift_final_step_only', True)
+                or i == num_grad_frames - 1
+            )
+            cur_loss, cur_loss_dict = self.cal_loss(
+                out,
+                cur_data,
+                tag=f'step{i + num_no_grad_frames}_',
+                apply_drift_loss=apply_drift_loss,
+            )
             loss_dict.update(cur_loss_dict)
             memory_dict = out['memory_dict']
 
@@ -505,7 +532,7 @@ class StreamLightningModule(BaseLightningModule):
             cur_data = data[i]
             cur_data['memory_dict'] = memory_dict
             out = self(cur_data)
-            _, cur_loss_dict = self.cal_loss(out, cur_data, tag=f'step{i}_')
+            _, cur_loss_dict = self.cal_loss(out, cur_data, tag=f'step{i}_', apply_drift_loss=False)
             reg_loss_dict[f'val/step{i}_reg_loss'] = cur_loss_dict[f'step{i}_reg_loss']
             memory_dict = out['memory_dict']
             

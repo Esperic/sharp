@@ -502,6 +502,10 @@ class Sharp(Sharp_I):
                  drift_loss_type="official",
                  drift_normalize_space=True,
                  drift_apply_to_single=False,
+                 drift_soft_tau=0.05,
+                 drift_error_gate=1.0,
+                 drift_protect_gt_direction=True,
+                 drift_final_step_only=True,
                  winner_metric="l2_sum",
                  winner_fde_weight=1.0,
                  mdf_r_list=(0.02, 0.1, 0.5),
@@ -515,6 +519,8 @@ class Sharp(Sharp_I):
                  use_label_smoothing_ce=False,
                  label_smoothing=0.05,
                  use_loss_weight_schedule=True,
+                 auxiliary_decay_start_epoch=None,
+                 auxiliary_decay_end_epoch=None,
                  **kwargs):
         super().__init__(**kwargs)
         self.use_stream_encoder = use_stream_encoder
@@ -538,6 +544,10 @@ class Sharp(Sharp_I):
         self.drift_loss_type = drift_loss_type
         self.drift_normalize_space = bool(drift_normalize_space)
         self.drift_apply_to_single = bool(drift_apply_to_single)
+        self.drift_soft_tau = float(drift_soft_tau)
+        self.drift_error_gate = float(drift_error_gate)
+        self.drift_protect_gt_direction = bool(drift_protect_gt_direction)
+        self.drift_final_step_only = bool(drift_final_step_only)
         self.winner_metric = winner_metric
         self.winner_fde_weight = float(winner_fde_weight)
         self.mdf_r_list = list(mdf_r_list)
@@ -551,6 +561,12 @@ class Sharp(Sharp_I):
         self.use_label_smoothing_ce = bool(use_label_smoothing_ce)
         self.label_smoothing = float(label_smoothing)
         self.use_loss_weight_schedule = bool(use_loss_weight_schedule)
+        self.auxiliary_decay_start_epoch = (
+            None if auxiliary_decay_start_epoch is None else int(auxiliary_decay_start_epoch)
+        )
+        self.auxiliary_decay_end_epoch = (
+            None if auxiliary_decay_end_epoch is None else int(auxiliary_decay_end_epoch)
+        )
 
         self.gmp_prior = None
         if self.use_gmp:

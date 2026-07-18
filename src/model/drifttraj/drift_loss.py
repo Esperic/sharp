@@ -82,6 +82,13 @@ def _safe_force(vec: torch.Tensor, aff: torch.Tensor, normalize_force: bool) -> 
     return force
 
 
+def _remove_away_component(force: torch.Tensor, target_direction: torch.Tensor, eps: float) -> torch.Tensor:
+    alignment = (force * target_direction).sum(dim=-1, keepdim=True)
+    away_component = alignment.clamp_max(0.0) * target_direction
+    away_component = away_component / target_direction.square().sum(dim=-1, keepdim=True).clamp_min(eps)
+    return force - away_component
+
+
 def _batched_cdist(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     xy_dot = torch.einsum("bns,bms->bnm", x, y)
     x_norm = x.square().sum(dim=-1, keepdim=True)
@@ -97,6 +104,10 @@ def _official_drifting_loss(
     r_list: Iterable[float] = (0.02, 0.1, 0.5),
     space: str = "traj",
     normalize_space: bool = False,
+    soft_tau: float = 0.05,
+    error_gate: float = 1.0,
+    protect_gt_direction: bool = True,
+    force_clip: float = 1.0,
     eps: float = 1e-8,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     gen_flat = flatten_trajectories(gen, space=space, normalize_space=normalize_space).unsqueeze(1)
@@ -116,11 +127,17 @@ def _official_drifting_loss(
     radii = tuple(float(r) for r in r_list)
     if not radii or min(radii) <= 0:
         raise ValueError(f"r_list must contain positive radii, got {radii}")
+    if soft_tau <= 0:
+        raise ValueError(f"soft_tau must be positive, got {soft_tau}")
+    if error_gate <= 0:
+        raise ValueError(f"error_gate must be positive, got {error_gate}")
 
     with torch.no_grad():
         dist = _batched_cdist(old_gen, targets, eps=eps)
         weighted_dist = dist * targets_w[:, None, :]
-        scale = (weighted_dist.mean() / targets_w.mean().clamp_min(eps)).clamp_min(1e-3)
+        scale = weighted_dist.mean(dim=(1, 2), keepdim=True)
+        scale = scale / targets_w.mean(dim=1, keepdim=True).unsqueeze(-1).clamp_min(eps)
+        scale = scale.clamp_min(1e-3)
         scale_inputs = (scale / (gen_flat.shape[-1] ** 0.5)).clamp_min(1e-3)
 
         old_gen_scaled = old_gen / scale_inputs
@@ -132,12 +149,15 @@ def _official_drifting_loss(
 
         total_force = torch.zeros_like(old_gen_scaled)
         split_idx = old_gen.shape[1] + neg_flat.shape[1]
-        stats = {"scale": scale.detach()}
+        raw_force_norms = []
+        pos_aff_values = []
+        neg_aff_values = []
+        stats = {"scale": scale.mean().detach()}
         for radius in radii:
             logits = -dist_normed / radius
             affinity = torch.softmax(logits, dim=-1)
             affinity_t = torch.softmax(logits, dim=-2)
-            affinity = torch.sqrt((affinity * affinity_t).clamp_min(1e-8))
+            affinity = torch.sqrt((affinity * affinity_t).clamp_min(0.0))
             affinity = affinity * targets_w[:, None, :]
 
             aff_neg = affinity[:, :, :split_idx]
@@ -152,9 +172,33 @@ def _official_drifting_loss(
             force = torch.matmul(coeff, targets_scaled)
             coeff_sum = coeff.sum(dim=-1, keepdim=True)
             force = force - coeff_sum * old_gen_scaled
-            force_norm = force.square().mean().clamp_min(eps).sqrt()
-            total_force = total_force + force / force_norm
-            stats[f"loss_R_{radius:g}"] = force_norm.detach()
+            force_rms = force.square().mean(dim=(-1, -2), keepdim=True).sqrt()
+            total_force = total_force + force / (force_rms + float(soft_tau))
+            raw_force_norms.append(force_rms.mean())
+            pos_aff_values.append(aff_pos.mean())
+            neg_aff_values.append(aff_neg.mean())
+            stats[f"loss_R_{radius:g}"] = force_rms.mean().detach()
+
+        to_gt = pos_flat / scale_inputs - old_gen_scaled
+        if protect_gt_direction:
+            total_force = _remove_away_component(total_force, to_gt, eps)
+            if space == "traj":
+                protected_endpoint = _remove_away_component(total_force[..., -2:], to_gt[..., -2:], eps)
+                total_force = torch.cat([total_force[..., :-2], protected_endpoint], dim=-1)
+            elif space == "mixed":
+                # The mixed representation contains the endpoint twice: once in
+                # the flattened trajectory and once as the appended endpoint.
+                protected_endpoint = _remove_away_component(total_force[..., -4:], to_gt[..., -4:], eps)
+                total_force = torch.cat([total_force[..., :-4], protected_endpoint], dim=-1)
+
+        winner_ade = torch.norm(gen.detach() - fixed_pos.detach(), dim=-1).mean(dim=-1)
+        accuracy_gate = (winner_ade / float(error_gate)).clamp(min=0.0, max=1.0)[:, None, None]
+        total_force = total_force * accuracy_gate
+
+        if force_clip is not None and force_clip > 0:
+            total_force_rms = total_force.square().mean(dim=(-1, -2), keepdim=True).sqrt()
+            clip_scale = (float(force_clip) / total_force_rms.clamp_min(eps)).clamp_max(1.0)
+            total_force = total_force * clip_scale
 
         goal_scaled = (old_gen_scaled + total_force).detach()
 
@@ -163,8 +207,9 @@ def _official_drifting_loss(
     if not torch.isfinite(loss):
         raise FloatingPointError("official drifting_loss produced NaN or Inf")
     stats["force_norm"] = total_force.norm(dim=-1).mean().detach()
-    stats["pos_aff"] = gen.new_zeros(())
-    stats["neg_aff"] = gen.new_zeros(())
+    stats["raw_force_norm"] = torch.stack(raw_force_norms).mean().detach()
+    stats["pos_aff"] = torch.stack(pos_aff_values).mean().detach()
+    stats["neg_aff"] = torch.stack(neg_aff_values).mean().detach()
     return loss, stats
 
 
@@ -183,6 +228,9 @@ def drifting_loss(
     space: str = "traj",
     normalize_space: bool = True,
     loss_type: str = "legacy",
+    soft_tau: float = 0.05,
+    error_gate: float = 1.0,
+    protect_gt_direction: bool = True,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     if gen.shape != fixed_pos.shape:
         raise ValueError(f"gen and fixed_pos must match, got {tuple(gen.shape)} and {tuple(fixed_pos.shape)}")
@@ -197,6 +245,10 @@ def drifting_loss(
             r_list=r_list,
             space=space,
             normalize_space=False,
+            soft_tau=soft_tau,
+            error_gate=error_gate,
+            protect_gt_direction=protect_gt_direction,
+            force_clip=force_clip,
         )
     if loss_type != "legacy":
         raise ValueError(f"Unsupported drift_loss_type={loss_type}")

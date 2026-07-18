@@ -71,8 +71,15 @@ def main(cfg):
         **trainer_kwargs
     )
 
-    trainer.fit(model, datamodule=datamodule, ckpt_path=cfg.checkpoint)
-    trainer.validate(model, datamodule.val_dataloader())
+    fit_succeeded = False
+    try:
+        trainer.fit(model, datamodule=datamodule, ckpt_path=cfg.checkpoint)
+        fit_succeeded = True
+    finally:
+        if wandb_logger is not None and trainer.is_global_zero:
+            import wandb
+
+            wandb.finish(exit_code=0 if fit_succeeded else 1)
 
 
 if __name__ == "__main__":
