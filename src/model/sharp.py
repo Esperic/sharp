@@ -439,7 +439,8 @@ class Sharp_I(nn.Module):
             'pi': pi,
             'y_hat_others': y_hat_others,
             'y_hat_single': y_hat_single,
-            'pi_single': pi_single
+            'pi_single': pi_single,
+            'drift_scene_feature': x_agent.detach(),
         }
         if gmp_aux is not None:
             ret_dict['gmp_xy'] = gmp_aux['xy'].detach()
@@ -506,6 +507,9 @@ class Sharp(Sharp_I):
                  drift_error_gate=1.0,
                  drift_protect_gt_direction=True,
                  drift_final_step_only=True,
+                 drift_num_waypoints=10,
+                 drift_endpoint_weight=2.0,
+                 drift_context_alpha=1.0,
                  winner_metric="l2_sum",
                  winner_fde_weight=1.0,
                  mdf_r_list=(0.02, 0.1, 0.5),
@@ -548,6 +552,9 @@ class Sharp(Sharp_I):
         self.drift_error_gate = float(drift_error_gate)
         self.drift_protect_gt_direction = bool(drift_protect_gt_direction)
         self.drift_final_step_only = bool(drift_final_step_only)
+        self.drift_num_waypoints = int(drift_num_waypoints)
+        self.drift_endpoint_weight = float(drift_endpoint_weight)
+        self.drift_context_alpha = float(drift_context_alpha)
         self.winner_metric = winner_metric
         self.winner_fde_weight = float(winner_fde_weight)
         self.mdf_r_list = list(mdf_r_list)

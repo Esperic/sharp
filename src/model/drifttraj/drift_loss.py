@@ -1,6 +1,7 @@
 from typing import Dict, Iterable, Tuple
 
 import torch
+import torch.distributed as torch_dist
 import torch.nn.functional as F
 
 
@@ -95,6 +96,167 @@ def _batched_cdist(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> torch
     y_norm = y.square().sum(dim=-1, keepdim=True).transpose(1, 2)
     sq_dist = (x_norm + y_norm - 2.0 * xy_dot).clamp_min(0.0)
     return (sq_dist + eps).sqrt()
+
+
+def sparse_trajectory_features(
+    y: torch.Tensor,
+    num_waypoints: int = 10,
+    endpoint_weight: float = 2.0,
+) -> torch.Tensor:
+    """Compact AV2-friendly path representation without per-sample normalization."""
+    if y.shape[-1] != 2 or y.shape[-2] < 1:
+        raise ValueError(f"Expected trajectories [...,T,2], got {tuple(y.shape)}")
+    count = min(max(int(num_waypoints), 1), y.shape[-2])
+    indices = (torch.arange(1, count + 1, device=y.device) * y.shape[-2] // count - 1).long()
+    waypoints = y.index_select(-2, indices)
+    return torch.cat(
+        [waypoints.flatten(start_dim=-2), y[..., -1, :] * float(endpoint_weight)],
+        dim=-1,
+    )
+
+
+def _all_gather_detached(value: torch.Tensor) -> Tuple[torch.Tensor, int]:
+    value = value.detach().contiguous()
+    if not torch_dist.is_available() or not torch_dist.is_initialized():
+        return value, 0
+    gathered = [torch.empty_like(value) for _ in range(torch_dist.get_world_size())]
+    torch_dist.all_gather(gathered, value)
+    return torch.cat(gathered, dim=0), torch_dist.get_rank() * value.shape[0]
+
+
+def joint_drifting_loss(
+    predictions: torch.Tensor,
+    ground_truth: torch.Tensor,
+    scene_feature: torch.Tensor,
+    r_list: Iterable[float] = (0.05, 0.2, 0.5),
+    num_waypoints: int = 10,
+    endpoint_weight: float = 2.0,
+    context_alpha: float = 1.0,
+    eps: float = 1e-8,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Scene-conditioned Drift over every mode and the full DDP batch pool."""
+    if predictions.ndim != 4 or ground_truth.ndim != 3 or scene_feature.ndim != 2:
+        raise ValueError(
+            "Expected predictions [B,K,T,2], ground_truth [B,T,2], and scene_feature [B,D]"
+        )
+    if predictions.shape[0] != ground_truth.shape[0] or predictions.shape[0] != scene_feature.shape[0]:
+        raise ValueError("predictions, ground_truth, and scene_feature must share the batch dimension")
+    if predictions.shape[2:] != ground_truth.shape[1:]:
+        raise ValueError("predictions and ground_truth must share trajectory length and coordinates")
+    if predictions.shape[1] < 2:
+        raise ValueError("joint_drifting_loss requires at least two generated modes")
+    if not all(torch.isfinite(value).all() for value in (predictions, ground_truth, scene_feature)):
+        raise FloatingPointError("joint_drifting_loss received non-finite inputs")
+
+    radii = tuple(float(radius) for radius in r_list)
+    if not radii or min(radii) <= 0:
+        raise ValueError(f"r_list must contain positive radii, got {radii}")
+
+    local_traj = sparse_trajectory_features(
+        predictions, num_waypoints=num_waypoints, endpoint_weight=endpoint_weight
+    ).float()
+    gt_traj = sparse_trajectory_features(
+        ground_truth, num_waypoints=num_waypoints, endpoint_weight=endpoint_weight
+    ).float()
+    local_scene = F.normalize(scene_feature.detach().float(), dim=-1)
+
+    with torch.no_grad():
+        global_scene, scene_offset = _all_gather_detached(local_scene)
+        global_gt, _ = _all_gather_detached(gt_traj)
+        global_pred, _ = _all_gather_detached(local_traj)
+
+        global_batch, num_modes, traj_dim = global_pred.shape
+        num_queries = global_batch * num_modes
+        global_pred = global_pred.reshape(num_queries, traj_dim)
+
+        # Pool normalization preserves relative path length while balancing the
+        # trajectory block against the unit-norm context block.
+        traj_rms = torch.cat([global_pred, global_gt], dim=0).square().mean().clamp_min(eps).sqrt()
+        traj_block_scale = traj_rms * (traj_dim ** 0.5)
+        global_pred = global_pred / traj_block_scale
+        global_gt = global_gt / traj_block_scale
+
+        query_scene = global_scene[:, None, :].expand(-1, num_modes, -1).reshape(num_queries, -1)
+        query_joint = torch.cat([float(context_alpha) * query_scene, global_pred], dim=-1)
+        positive_joint = torch.cat([float(context_alpha) * global_scene, global_gt], dim=-1)
+        targets_joint = torch.cat([query_joint, positive_joint], dim=0)
+
+        query_joint = query_joint.unsqueeze(0)
+        targets_joint = targets_joint.unsqueeze(0)
+        pair_dist = _batched_cdist(query_joint, targets_joint, eps=eps)
+        scale = pair_dist.mean().clamp_min(1e-3)
+        scale_inputs = (scale / (query_joint.shape[-1] ** 0.5)).clamp_min(1e-3)
+        dist_normed = pair_dist / scale
+        dist_normed[:, :, :num_queries] += torch.eye(
+            num_queries, device=predictions.device, dtype=dist_normed.dtype
+        )[None] * 100.0
+
+        old_traj = (global_pred / scale_inputs).unsqueeze(0)
+        target_traj = torch.cat([global_pred, global_gt], dim=0).unsqueeze(0) / scale_inputs
+        total_force = torch.zeros_like(old_traj)
+        positive_distributions = []
+        pos_masses = []
+        neg_masses = []
+        raw_force_rms = []
+        stats = {"scale": scale.detach(), "traj_scale": traj_block_scale.detach()}
+
+        for radius in radii:
+            logits = -dist_normed / radius
+            affinity = torch.softmax(logits, dim=-1)
+            affinity_t = torch.softmax(logits, dim=-2)
+            affinity = torch.sqrt((affinity * affinity_t).clamp_min(1e-6))
+            aff_neg = affinity[:, :, :num_queries]
+            aff_pos = affinity[:, :, num_queries:]
+
+            sum_pos = aff_pos.sum(dim=-1, keepdim=True)
+            sum_neg = aff_neg.sum(dim=-1, keepdim=True)
+            coeff = torch.cat([-aff_neg * sum_pos, aff_pos * sum_neg], dim=-1)
+            force = torch.matmul(coeff, target_traj)
+            force = force - coeff.sum(dim=-1, keepdim=True) * old_traj
+            force_rms = force.square().mean().clamp_min(1e-8).sqrt()
+            total_force = total_force + force / force_rms
+
+            positive_distributions.append(aff_pos / sum_pos.clamp_min(eps))
+            pos_masses.append(sum_pos.mean())
+            neg_masses.append(sum_neg.mean())
+            raw_force_rms.append(force_rms)
+            stats[f"loss_R_{radius:g}"] = force.square().mean().detach()
+
+        positive_distribution = torch.stack(positive_distributions).mean(dim=0).squeeze(0)
+        query_idx = torch.arange(num_queries, device=predictions.device)
+        own_scene_idx = torch.div(query_idx, num_modes, rounding_mode="floor")
+        own_gt_affinity = positive_distribution[query_idx, own_scene_idx]
+        effective_positive_count = positive_distribution.square().sum(dim=-1).clamp_min(eps).reciprocal()
+        self_negative_affinity = affinity[0, query_idx, query_idx]
+        goal = (old_traj + total_force).detach().squeeze(0)
+
+        local_query_offset = scene_offset * num_modes
+        local_query_count = predictions.shape[0] * num_modes
+        local_goal = goal[local_query_offset:local_query_offset + local_query_count]
+        target_shift_rms = total_force.square().mean().sqrt()
+
+        endpoints = predictions.detach()[..., -1, :].float()
+        endpoint_dist = torch.cdist(endpoints, endpoints)
+        offdiag = ~torch.eye(num_modes, device=predictions.device, dtype=torch.bool)[None]
+
+        stats.update({
+            "force_norm": total_force.norm(dim=-1).mean().detach(),
+            "raw_force_norm": torch.stack(raw_force_rms).mean().detach(),
+            "target_shift_rms": target_shift_rms.detach(),
+            "pos_aff": torch.stack(pos_masses).mean().detach(),
+            "neg_aff": torch.stack(neg_masses).mean().detach(),
+            "effective_positive_count": effective_positive_count.mean().detach(),
+            "own_gt_affinity": own_gt_affinity.mean().detach(),
+            "cross_scene_gt_affinity": (1.0 - own_gt_affinity).mean().detach(),
+            "self_negative_affinity": self_negative_affinity.mean().detach(),
+            "pairwise_endpoint_distance": endpoint_dist[offdiag.expand_as(endpoint_dist)].mean().detach(),
+        })
+
+    local_traj_scaled = local_traj.reshape(-1, local_traj.shape[-1]) / traj_block_scale / scale_inputs
+    loss = F.mse_loss(local_traj_scaled, local_goal)
+    if not torch.isfinite(loss):
+        raise FloatingPointError("joint_drifting_loss produced NaN or Inf")
+    return loss, stats
 
 
 def _official_drifting_loss(

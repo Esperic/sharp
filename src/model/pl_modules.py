@@ -13,6 +13,7 @@ from src.utils.optim import WarmupCosLR
 from src.model.drifttraj import (
     drifting_loss,
     endpoint_diversity_loss,
+    joint_drifting_loss,
     select_winner,
     split_winner_and_others,
 )
@@ -193,27 +194,39 @@ class BaseLightningModule(pl.LightningModule):
         current_epoch = int(getattr(self, 'current_epoch', 0))
         use_loss_weight_schedule = bool(getattr(self.model, 'use_loss_weight_schedule', True))
         if use_drift_loss:
-            winner, others = split_winner_and_others(y_hat[..., :2], best_mode)
             radii = getattr(self.model, 'mdf_r_list', [0.1]) if use_mdf else [getattr(self.model, 'drift_single_radius', 0.1)]
-            drift_loss_value, drift_stats = drifting_loss(
-                gen=winner,
-                fixed_pos=y,
-                fixed_neg=others,
-                r_list=radii,
-                use_mdf=use_mdf,
-                include_old_gen_as_neg=getattr(self.model, 'mdf_include_old_gen_as_neg', True),
-                normalize_force=getattr(self.model, 'mdf_normalize_force', True),
-                pos_weight=getattr(self.model, 'mdf_positive_weight', 1.0),
-                neg_weight=getattr(self.model, 'mdf_negative_weight', 1.0),
-                force_clip=getattr(self.model, 'drift_force_clip', 1.0),
-                detach_target=getattr(self.model, 'drift_detach_target', True),
-                space=getattr(self.model, 'drift_space', 'traj'),
-                normalize_space=getattr(self.model, 'drift_normalize_space', True),
-                loss_type=getattr(self.model, 'drift_loss_type', 'official'),
-                soft_tau=getattr(self.model, 'drift_soft_tau', 0.05),
-                error_gate=getattr(self.model, 'drift_error_gate', 1.0),
-                protect_gt_direction=getattr(self.model, 'drift_protect_gt_direction', True),
-            )
+            drift_loss_type = getattr(self.model, 'drift_loss_type', 'official')
+            if drift_loss_type == 'joint_official':
+                drift_loss_value, drift_stats = joint_drifting_loss(
+                    predictions=y_hat[..., :2],
+                    ground_truth=y,
+                    scene_feature=out['drift_scene_feature'],
+                    r_list=radii,
+                    num_waypoints=getattr(self.model, 'drift_num_waypoints', 10),
+                    endpoint_weight=getattr(self.model, 'drift_endpoint_weight', 2.0),
+                    context_alpha=getattr(self.model, 'drift_context_alpha', 1.0),
+                )
+            else:
+                winner, others = split_winner_and_others(y_hat[..., :2], best_mode)
+                drift_loss_value, drift_stats = drifting_loss(
+                    gen=winner,
+                    fixed_pos=y,
+                    fixed_neg=others,
+                    r_list=radii,
+                    use_mdf=use_mdf,
+                    include_old_gen_as_neg=getattr(self.model, 'mdf_include_old_gen_as_neg', True),
+                    normalize_force=getattr(self.model, 'mdf_normalize_force', True),
+                    pos_weight=getattr(self.model, 'mdf_positive_weight', 1.0),
+                    neg_weight=getattr(self.model, 'mdf_negative_weight', 1.0),
+                    force_clip=getattr(self.model, 'drift_force_clip', 1.0),
+                    detach_target=getattr(self.model, 'drift_detach_target', True),
+                    space=getattr(self.model, 'drift_space', 'traj'),
+                    normalize_space=getattr(self.model, 'drift_normalize_space', True),
+                    loss_type=drift_loss_type,
+                    soft_tau=getattr(self.model, 'drift_soft_tau', 0.05),
+                    error_gate=getattr(self.model, 'drift_error_gate', 1.0),
+                    protect_gt_direction=getattr(self.model, 'drift_protect_gt_direction', True),
+                )
             drift_base_w = getattr(self.model, 'drift_weight', 0.0)
             drift_w = (
                 scheduled_weight(
@@ -227,14 +240,12 @@ class BaseLightningModule(pl.LightningModule):
                 else float(drift_base_w)
             )
             extra_loss = extra_loss + drift_w * drift_loss_value
+            extra_disp_dict[f'{tag}drift_loss'] = drift_loss_value.item()
+            extra_disp_dict[f'{tag}drift_weight'] = drift_w
+            extra_disp_dict[f'{tag}drift_weighted_loss'] = (drift_w * drift_loss_value).item()
             extra_disp_dict.update({
-                f'{tag}drift_loss': drift_loss_value.item(),
-                f'{tag}drift_weight': drift_w,
-                f'{tag}drift_force_norm': drift_stats['force_norm'].item(),
-                f'{tag}drift_raw_force_norm': drift_stats.get('raw_force_norm', drift_stats['force_norm']).item(),
-                f'{tag}drift_scale': drift_stats.get('scale', y_hat.new_zeros(())).item(),
-                f'{tag}drift_pos_aff': drift_stats['pos_aff'].item(),
-                f'{tag}drift_neg_aff': drift_stats['neg_aff'].item(),
+                f'{tag}drift_{name}': value.item()
+                for name, value in drift_stats.items()
             })
 
         if use_endpoint_diversity:
