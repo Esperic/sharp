@@ -55,7 +55,7 @@ pl_module:
     drift_context_alpha: 1.0
     winner_metric: l2_sum
     winner_fde_weight: 1.0
-    mdf_r_list: [0.05, 0.2, 0.5]
+    mdf_r_list: [0.02, 0.05, 0.2]
     mdf_normalize_force: true
     mdf_positive_weight: 1.0
     mdf_negative_weight: 1.0
@@ -66,8 +66,8 @@ pl_module:
     use_label_smoothing_ce: false
     label_smoothing: 0.05
     use_loss_weight_schedule: true
-    auxiliary_decay_start_epoch:
-    auxiliary_decay_end_epoch:
+    auxiliary_decay_start_epoch: 10
+    auxiliary_decay_end_epoch: 25
   optim:
     lr: 1e-3
     weight_decay: 1e-2

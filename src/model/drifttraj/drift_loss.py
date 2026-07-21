@@ -199,14 +199,16 @@ def joint_drifting_loss(
         neg_masses = []
         raw_force_rms = []
         stats = {"scale": scale.detach(), "traj_scale": traj_block_scale.detach()}
+        query_idx = torch.arange(num_queries, device=predictions.device)
 
         for radius in radii:
             logits = -dist_normed / radius
             affinity = torch.softmax(logits, dim=-1)
             affinity_t = torch.softmax(logits, dim=-2)
-            affinity = torch.sqrt((affinity * affinity_t).clamp_min(1e-6))
+            affinity = torch.sqrt((affinity * affinity_t).clamp_min(0.0))
             aff_neg = affinity[:, :, :num_queries]
             aff_pos = affinity[:, :, num_queries:]
+            aff_neg[:, query_idx, query_idx] = 0.0
 
             sum_pos = aff_pos.sum(dim=-1, keepdim=True)
             sum_neg = aff_neg.sum(dim=-1, keepdim=True)
@@ -223,7 +225,6 @@ def joint_drifting_loss(
             stats[f"loss_R_{radius:g}"] = force.square().mean().detach()
 
         positive_distribution = torch.stack(positive_distributions).mean(dim=0).squeeze(0)
-        query_idx = torch.arange(num_queries, device=predictions.device)
         own_scene_idx = torch.div(query_idx, num_modes, rounding_mode="floor")
         own_gt_affinity = positive_distribution[query_idx, own_scene_idx]
         effective_positive_count = positive_distribution.square().sum(dim=-1).clamp_min(eps).reciprocal()
