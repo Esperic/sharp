@@ -476,6 +476,7 @@ class Sharp(Sharp_I):
                  dual=False,
                  biased_interaction=False,
                  ma=False,
+                 vehicle_only=False,
                  use_gmp=False,
                  use_drift_loss=False,
                  use_mdf=False,
@@ -532,6 +533,7 @@ class Sharp(Sharp_I):
         self.use_target_context = use_target_context
         self.embed_dim = kwargs['embed_dim']
         self.pose_dim = 4
+        self.vehicle_only = bool(vehicle_only)
         self.use_gmp = bool(use_gmp)
         self.use_drift_loss = bool(use_drift_loss)
         self.use_mdf = bool(use_mdf)

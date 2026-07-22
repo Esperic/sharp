@@ -26,9 +26,17 @@ class minFDE(Metric):
         self.add_state('sum', default=torch.tensor(0.0), dist_reduce_fx='sum')
         self.add_state('count', default=torch.tensor(0), dist_reduce_fx='sum')
 
-    def update(self, outputs: Dict[str, torch.Tensor], target: torch.Tensor) -> None:
+    def update(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        target: torch.Tensor,
+        sample_mask: torch.Tensor = None,
+    ) -> None:
         with torch.no_grad():
             pred, _ = sort_predictions(outputs['y_hat'], outputs['pi'], k=self.k)
+            if sample_mask is not None:
+                pred = pred[sample_mask]
+                target = target[sample_mask]
             fde = torch.norm(
                 pred[..., -1, :2] - target.unsqueeze(1)[..., -1, :2], p=2, dim=-1
             )
@@ -37,13 +45,23 @@ class minFDE(Metric):
             self.count += pred.shape[0]
 
     def compute(self) -> torch.Tensor:
-        return self.sum / self.count
+        return self.sum / self.count.clamp_min(1)
 
 
 class brier_minFDE(minFDE):
-    def update(self, outputs: Dict[str, torch.Tensor], target: torch.Tensor, normalized_probability=False) -> None:
+    def update(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        target: torch.Tensor,
+        normalized_probability=False,
+        sample_mask: torch.Tensor = None,
+    ) -> None:
         with torch.no_grad():
             pred, prob = sort_predictions(outputs['y_hat'], outputs['pi'], k=self.k)
+            if sample_mask is not None:
+                pred = pred[sample_mask]
+                prob = prob[sample_mask]
+                target = target[sample_mask]
             fde = torch.norm(
                 pred[..., -1, :2] - target.unsqueeze(1)[..., -1, :2], p=2, dim=-1
             )

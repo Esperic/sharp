@@ -128,6 +128,7 @@ def joint_drifting_loss(
     predictions: torch.Tensor,
     ground_truth: torch.Tensor,
     scene_feature: torch.Tensor,
+    valid_scene_mask: torch.Tensor = None,
     r_list: Iterable[float] = (0.05, 0.2, 0.5),
     num_waypoints: int = 10,
     endpoint_weight: float = 2.0,
@@ -145,6 +146,17 @@ def joint_drifting_loss(
         raise ValueError("predictions and ground_truth must share trajectory length and coordinates")
     if predictions.shape[1] < 2:
         raise ValueError("joint_drifting_loss requires at least two generated modes")
+    if valid_scene_mask is None:
+        valid_scene_mask = torch.ones(
+            predictions.shape[0], dtype=torch.bool, device=predictions.device
+        )
+    elif valid_scene_mask.shape != (predictions.shape[0],):
+        raise ValueError(
+            f"valid_scene_mask must have shape {(predictions.shape[0],)}, "
+            f"got {tuple(valid_scene_mask.shape)}"
+        )
+    else:
+        valid_scene_mask = valid_scene_mask.to(device=predictions.device, dtype=torch.bool)
     if not all(torch.isfinite(value).all() for value in (predictions, ground_truth, scene_feature)):
         raise FloatingPointError("joint_drifting_loss received non-finite inputs")
 
@@ -164,6 +176,34 @@ def joint_drifting_loss(
         global_scene, scene_offset = _all_gather_detached(local_scene)
         global_gt, _ = _all_gather_detached(gt_traj)
         global_pred, _ = _all_gather_detached(local_traj)
+        global_valid_scene, _ = _all_gather_detached(valid_scene_mask.to(torch.uint8))
+        global_valid_scene = global_valid_scene.bool()
+
+        valid_before_local = int(global_valid_scene[:scene_offset].sum().item())
+        global_scene = global_scene[global_valid_scene]
+        global_gt = global_gt[global_valid_scene]
+        global_pred = global_pred[global_valid_scene]
+
+        if global_scene.shape[0] == 0:
+            zero = predictions.new_zeros(())
+            stats = {
+                "scale": zero,
+                "traj_scale": zero,
+                "force_norm": zero,
+                "raw_force_norm": zero,
+                "target_shift_rms": zero,
+                "pos_aff": zero,
+                "neg_aff": zero,
+                "effective_positive_count": zero,
+                "own_gt_affinity": zero,
+                "cross_scene_gt_affinity": zero,
+                "self_negative_affinity": zero,
+                "pairwise_endpoint_distance": zero,
+            }
+            stats.update({f"loss_R_{radius:g}": zero for radius in radii})
+            with torch.enable_grad():
+                zero_loss = predictions.sum() * 0.0
+            return zero_loss, stats
 
         global_batch, num_modes, traj_dim = global_pred.shape
         num_queries = global_batch * num_modes
@@ -231,14 +271,19 @@ def joint_drifting_loss(
         self_negative_affinity = affinity[0, query_idx, query_idx]
         goal = (old_traj + total_force).detach().squeeze(0)
 
-        local_query_offset = scene_offset * num_modes
-        local_query_count = predictions.shape[0] * num_modes
+        local_query_offset = valid_before_local * num_modes
+        local_query_count = int(valid_scene_mask.sum().item()) * num_modes
         local_goal = goal[local_query_offset:local_query_offset + local_query_count]
         target_shift_rms = total_force.square().mean().sqrt()
 
-        endpoints = predictions.detach()[..., -1, :].float()
+        endpoints = predictions.detach()[valid_scene_mask, :, -1, :].float()
         endpoint_dist = torch.cdist(endpoints, endpoints)
         offdiag = ~torch.eye(num_modes, device=predictions.device, dtype=torch.bool)[None]
+        pairwise_endpoint_distance = (
+            endpoint_dist[offdiag.expand_as(endpoint_dist)].mean()
+            if endpoints.shape[0] > 0
+            else predictions.new_zeros(())
+        )
 
         stats.update({
             "force_norm": total_force.norm(dim=-1).mean().detach(),
@@ -250,10 +295,16 @@ def joint_drifting_loss(
             "own_gt_affinity": own_gt_affinity.mean().detach(),
             "cross_scene_gt_affinity": (1.0 - own_gt_affinity).mean().detach(),
             "self_negative_affinity": self_negative_affinity.mean().detach(),
-            "pairwise_endpoint_distance": endpoint_dist[offdiag.expand_as(endpoint_dist)].mean().detach(),
+            "pairwise_endpoint_distance": pairwise_endpoint_distance.detach(),
         })
 
-    local_traj_scaled = local_traj.reshape(-1, local_traj.shape[-1]) / traj_block_scale / scale_inputs
+    local_traj_scaled = (
+        local_traj[valid_scene_mask].reshape(-1, local_traj.shape[-1])
+        / traj_block_scale
+        / scale_inputs
+    )
+    if local_traj_scaled.shape[0] == 0:
+        return predictions.sum() * 0.0, stats
     loss = F.mse_loss(local_traj_scaled, local_goal)
     if not torch.isfinite(loss):
         raise FloatingPointError("joint_drifting_loss produced NaN or Inf")

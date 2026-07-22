@@ -19,6 +19,7 @@ pl_module:
     biased_interaction: True
     dm: av2
     k: 6
+    vehicle_only: true
     use_gmp: false
     use_drift_loss: false
     use_mdf: false

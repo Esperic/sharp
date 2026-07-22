@@ -26,9 +26,17 @@ class minADE(Metric):
         self.add_state('sum', default=torch.tensor(0.0), dist_reduce_fx='sum')
         self.add_state('count', default=torch.tensor(0), dist_reduce_fx='sum')
 
-    def update(self, outputs: Dict[str, torch.Tensor], target: torch.Tensor) -> None:
+    def update(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        target: torch.Tensor,
+        sample_mask: torch.Tensor = None,
+    ) -> None:
         with torch.no_grad():
             pred, _ = sort_predictions(outputs['y_hat'], outputs['pi'], k=self.k)
+            if sample_mask is not None:
+                pred = pred[sample_mask]
+                target = target[sample_mask]
             ade = torch.norm(
                 pred[..., :2] - target.unsqueeze(1)[..., :2], p=2, dim=-1
             ).mean(-1)
@@ -37,4 +45,4 @@ class minADE(Metric):
             self.count += pred.size(0)
 
     def compute(self) -> torch.Tensor:
-        return self.sum / self.count
+        return self.sum / self.count.clamp_min(1)

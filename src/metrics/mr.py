@@ -24,9 +24,17 @@ class MR(Metric):
         self.add_state('count', default=torch.tensor(0), dist_reduce_fx='sum')
         self.miss_threshold = miss_threshold
 
-    def update(self, outputs: Dict[str, torch.Tensor], target: torch.Tensor) -> None:
+    def update(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        target: torch.Tensor,
+        sample_mask: torch.Tensor = None,
+    ) -> None:
         with torch.no_grad():
             pred = outputs['y_hat']
+            if sample_mask is not None:
+                pred = pred[sample_mask]
+                target = target[sample_mask]
             missed_pred = (
                 torch.norm(
                     pred[..., -1, :2] - target.unsqueeze(1)[..., -1, :2], p=2, dim=-1
@@ -37,4 +45,4 @@ class MR(Metric):
             self.count += pred.shape[0]
 
     def compute(self) -> torch.Tensor:
-        return self.sum / self.count
+        return self.sum / self.count.clamp_min(1)

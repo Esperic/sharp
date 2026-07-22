@@ -52,6 +52,13 @@ class BaseLightningModule(pl.LightningModule):
 
     def forward(self, data):
         return self.model(data)
+
+    def target_sample_mask(self, data):
+        if not getattr(self.model, 'vehicle_only', False):
+            return torch.ones(data['x_attr'].shape[0], dtype=torch.bool, device=data['x_attr'].device)
+        # AV2 combined type 0 is a motor vehicle (vehicle or bus). Other
+        # actors remain in x_attr as scene context, but receive no target loss.
+        return data['x_attr'][:, 0, 2].long() == 0
     
     def load_chkpt(self, ckpt_path, multi=False):
         ckpt = torch.load(ckpt_path, map_location="cpu")["state_dict"]
@@ -138,6 +145,7 @@ class BaseLightningModule(pl.LightningModule):
         if new_y_hat is not None: new_y_hat = new_y_hat[:, :, :gt_len]
         new_pi = out.get('pi_single', None)
         y, y_others = data['target'][:, 0], data['target'][:, 1:]
+        target_sample_mask = self.target_sample_mask(data)
 
         configured_use_drift_loss = bool(getattr(self.model, 'use_drift_loss', False))
         use_drift_loss = configured_use_drift_loss and apply_drift_loss
@@ -158,13 +166,26 @@ class BaseLightningModule(pl.LightningModule):
             l2_norm = torch.norm(y_hat[..., :2] - y.unsqueeze(1), dim=-1).sum(dim=-1)
             best_mode = torch.argmin(l2_norm, dim=-1)
         y_hat_best = y_hat[torch.arange(y_hat.shape[0]), best_mode]
-        agent_reg_loss = F.smooth_l1_loss(y_hat_best[..., :2], y)
+        zero_loss = y_hat.sum() * 0.0
+        agent_reg_loss = (
+            F.smooth_l1_loss(y_hat_best[target_sample_mask, ..., :2], y[target_sample_mask])
+            if target_sample_mask.any()
+            else zero_loss
+        )
         label_smoothing = (
             getattr(self.model, 'label_smoothing', 0.0)
             if getattr(self.model, 'use_label_smoothing_ce', False) and extra_training_loss_active
             else 0.0
         )
-        agent_cls_loss = F.cross_entropy(pi, best_mode.detach(), label_smoothing=label_smoothing)
+        agent_cls_loss = (
+            F.cross_entropy(
+                pi[target_sample_mask],
+                best_mode[target_sample_mask].detach(),
+                label_smoothing=label_smoothing,
+            )
+            if target_sample_mask.any()
+            else zero_loss
+        )
 
         if new_y_hat is not None:
             if getattr(self.model, 'drift_apply_to_single', False) and extra_training_loss_active:
@@ -178,15 +199,33 @@ class BaseLightningModule(pl.LightningModule):
                 l2_norm = torch.norm(new_y_hat[..., :2] - y.unsqueeze(1), dim=-1).sum(dim=-1)
                 new_best_mode = torch.argmin(l2_norm, dim=-1)
             new_y_hat_best = new_y_hat[torch.arange(new_y_hat.shape[0]), new_best_mode]
-            new_agent_reg_loss = F.smooth_l1_loss(new_y_hat_best[..., :2], y)
-            new_agent_cls_loss = F.cross_entropy(new_pi, new_best_mode.detach(), label_smoothing=label_smoothing)
+            new_agent_reg_loss = (
+                F.smooth_l1_loss(
+                    new_y_hat_best[target_sample_mask, ..., :2], y[target_sample_mask]
+                )
+                if target_sample_mask.any()
+                else zero_loss
+            )
+            new_agent_cls_loss = (
+                F.cross_entropy(
+                    new_pi[target_sample_mask],
+                    new_best_mode[target_sample_mask].detach(),
+                    label_smoothing=label_smoothing,
+                )
+                if target_sample_mask.any()
+                else zero_loss
+            )
         else:
             new_agent_reg_loss = 0
             new_agent_cls_loss = 0
 
         others_reg_mask = data['target_mask'][:, 1:]
-        others_reg_loss = F.smooth_l1_loss(
-            y_hat_others[others_reg_mask], y_others[others_reg_mask]
+        if getattr(self.model, 'vehicle_only', False):
+            others_reg_mask = others_reg_mask & (data['x_attr'][:, 1:, 2:3].long() == 0)
+        others_reg_loss = (
+            F.smooth_l1_loss(y_hat_others[others_reg_mask], y_others[others_reg_mask])
+            if others_reg_mask.any()
+            else zero_loss
         )
 
         extra_loss = y_hat.new_zeros(())
@@ -201,6 +240,7 @@ class BaseLightningModule(pl.LightningModule):
                     predictions=y_hat[..., :2],
                     ground_truth=y,
                     scene_feature=out['drift_scene_feature'],
+                    valid_scene_mask=target_sample_mask,
                     r_list=radii,
                     num_waypoints=getattr(self.model, 'drift_num_waypoints', 10),
                     endpoint_weight=getattr(self.model, 'drift_endpoint_weight', 2.0),
@@ -208,25 +248,29 @@ class BaseLightningModule(pl.LightningModule):
                 )
             else:
                 winner, others = split_winner_and_others(y_hat[..., :2], best_mode)
-                drift_loss_value, drift_stats = drifting_loss(
-                    gen=winner,
-                    fixed_pos=y,
-                    fixed_neg=others,
-                    r_list=radii,
-                    use_mdf=use_mdf,
-                    include_old_gen_as_neg=getattr(self.model, 'mdf_include_old_gen_as_neg', True),
-                    normalize_force=getattr(self.model, 'mdf_normalize_force', True),
-                    pos_weight=getattr(self.model, 'mdf_positive_weight', 1.0),
-                    neg_weight=getattr(self.model, 'mdf_negative_weight', 1.0),
-                    force_clip=getattr(self.model, 'drift_force_clip', 1.0),
-                    detach_target=getattr(self.model, 'drift_detach_target', True),
-                    space=getattr(self.model, 'drift_space', 'traj'),
-                    normalize_space=getattr(self.model, 'drift_normalize_space', True),
-                    loss_type=drift_loss_type,
-                    soft_tau=getattr(self.model, 'drift_soft_tau', 0.05),
-                    error_gate=getattr(self.model, 'drift_error_gate', 1.0),
-                    protect_gt_direction=getattr(self.model, 'drift_protect_gt_direction', True),
-                )
+                if target_sample_mask.any():
+                    drift_loss_value, drift_stats = drifting_loss(
+                        gen=winner[target_sample_mask],
+                        fixed_pos=y[target_sample_mask],
+                        fixed_neg=others[target_sample_mask],
+                        r_list=radii,
+                        use_mdf=use_mdf,
+                        include_old_gen_as_neg=getattr(self.model, 'mdf_include_old_gen_as_neg', True),
+                        normalize_force=getattr(self.model, 'mdf_normalize_force', True),
+                        pos_weight=getattr(self.model, 'mdf_positive_weight', 1.0),
+                        neg_weight=getattr(self.model, 'mdf_negative_weight', 1.0),
+                        force_clip=getattr(self.model, 'drift_force_clip', 1.0),
+                        detach_target=getattr(self.model, 'drift_detach_target', True),
+                        space=getattr(self.model, 'drift_space', 'traj'),
+                        normalize_space=getattr(self.model, 'drift_normalize_space', True),
+                        loss_type=drift_loss_type,
+                        soft_tau=getattr(self.model, 'drift_soft_tau', 0.05),
+                        error_gate=getattr(self.model, 'drift_error_gate', 1.0),
+                        protect_gt_direction=getattr(self.model, 'drift_protect_gt_direction', True),
+                    )
+                else:
+                    drift_loss_value = zero_loss
+                    drift_stats = {}
             drift_base_w = getattr(self.model, 'drift_weight', 0.0)
             drift_w = (
                 scheduled_weight(
@@ -252,6 +296,7 @@ class BaseLightningModule(pl.LightningModule):
             diversity_loss = endpoint_diversity_loss(
                 y_hat[..., :2],
                 sigma=getattr(self.model, 'diversity_sigma', 2.0),
+                valid_mask=target_sample_mask,
             )
             diversity_base_w = getattr(self.model, 'diversity_weight', 0.0)
             diversity_w = (
@@ -324,7 +369,11 @@ class BaseLightningModule(pl.LightningModule):
         if self.ma:
             metrics = self.metrics(out, data['target'], data["scored_mask"])
         else:
-            metrics = self.metrics(out, data['target'][:, 0])
+            metrics = self.metrics(
+                out,
+                data['target'][:, 0],
+                sample_mask=self.target_sample_mask(data),
+            )
 
         self.log(
             'val/reg_loss',
@@ -588,7 +637,11 @@ class StreamLightningModule(BaseLightningModule):
             gt_len = data[-1]['target'][:, 0].shape[-2] 
             all_outs[-1]["y_hat"] = all_outs[-1]["y_hat"][:, :, :gt_len]
 
-            metrics = self.metrics(all_outs[-1], data[-1]['target'][:, 0])
+            metrics = self.metrics(
+                all_outs[-1],
+                data[-1]['target'][:, 0],
+                sample_mask=self.target_sample_mask(data[-1]),
+            )
 
         self.log_dict(
             reg_loss_dict,
