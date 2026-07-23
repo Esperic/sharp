@@ -38,7 +38,7 @@ def load_pretrained_weights(model, ckpt_path):
     if not ckpt_path:
         return
     logger.info(f"Warm-starting model weights from {ckpt_path}")
-    incompatible = model.load_chkpt(ckpt_path)
+    incompatible = model.load_chkpt(ckpt_path, reset_anchor_residual=True)
     if incompatible is not None:
         logger.info(f"Missing keys while loading pretrained weights: {incompatible.missing_keys}")
         logger.info(f"Unexpected keys while loading pretrained weights: {incompatible.unexpected_keys}")

@@ -445,6 +445,8 @@ class Sharp_I(nn.Module):
         if gmp_aux is not None:
             ret_dict['gmp_xy'] = gmp_aux['xy'].detach()
             ret_dict['gmp_comp_idx'] = gmp_aux['comp_idx'].detach()
+            if gmp_aux.get('anchor_trajs') is not None:
+                ret_dict['gmp_anchor_trajs'] = gmp_aux['anchor_trajs'].detach()
 
         glo_y_hat = torch.bmm(y_hat.detach()[..., :2].reshape(B, -1, 2), torch.inverse(rot_mat))
         glo_y_hat = glo_y_hat.reshape(B, y_hat.size(1), -1, 2)
@@ -494,6 +496,7 @@ class Sharp(Sharp_I):
                  gmp_condition_memory=True,
                  use_gmp_prior_logit_bias=True,
                  gmp_prior_logit_bias_weight=0.05,
+                 gmp_anchor_residual=False,
                  use_endpoint_diversity=False,
                  drift_weight=0.1,
                  drift_warmup_epochs=5,
@@ -543,6 +546,9 @@ class Sharp(Sharp_I):
         self.gmp_condition_pi = bool(gmp_condition_pi)
         self.gmp_condition_memory = bool(gmp_condition_memory)
         self.gmp_prior_logit_bias_weight = float(gmp_prior_logit_bias_weight)
+        self.gmp_anchor_residual = bool(gmp_anchor_residual)
+        if self.gmp_anchor_residual and not self.use_gmp:
+            raise ValueError("gmp_anchor_residual=True requires use_gmp=True")
         self.use_endpoint_diversity = bool(use_endpoint_diversity)
         self.drift_weight = float(drift_weight)
         self.drift_warmup_epochs = int(drift_warmup_epochs)
@@ -598,6 +604,8 @@ class Sharp(Sharp_I):
                 condition_memory=gmp_condition_memory,
                 use_prior_logit_bias=use_gmp_prior_logit_bias,
                 latent_dim=gmp_latent_dim,
+                anchor_residual=self.gmp_anchor_residual,
+                future_steps=kwargs['future_steps'],
             )
 
         self.decoder = MultimodalDecoder(
@@ -693,6 +701,8 @@ class Sharp(Sharp_I):
             grad = []
             for name, param in self.named_parameters():
                 print("grad", name)
+        if self.gmp_anchor_residual:
+            self.reset_anchor_residual_heads()
 
     def _build_gmp_aux(self, data, batch_size, device):
         if not self.use_gmp or self.gmp_prior is None:
@@ -705,7 +715,14 @@ class Sharp(Sharp_I):
             training=self.training,
             target_types=target_types,
         )
-        query_delta = self.gmp_prior.xy_to_query_delta(gmp_xy)
+        anchor_trajs = None
+        if self.gmp_anchor_residual:
+            anchor_trajs, query_trajs = self.gmp_prior.trajectory_anchors(
+                gmp_comp_idx, target_types
+            )
+            query_delta = self.gmp_prior.trajectory_to_query_delta(query_trajs)
+        else:
+            query_delta = self.gmp_prior.xy_to_query_delta(gmp_xy)
         pi_bias = (
             self.gmp_prior.xy_to_pi_bias(gmp_xy, gmp_comp_idx, target_types)
             if self.gmp_condition_pi else None
@@ -715,4 +732,11 @@ class Sharp(Sharp_I):
             'comp_idx': gmp_comp_idx,
             'query_delta': query_delta,
             'pi_bias': pi_bias,
+            'anchor_trajs': anchor_trajs,
         }
+
+    def reset_anchor_residual_heads(self):
+        for head in (self.decoder.loc, getattr(self, 'stream_loc', None)):
+            if head is not None:
+                nn.init.zeros_(head[-1].weight)
+                nn.init.zeros_(head[-1].bias)

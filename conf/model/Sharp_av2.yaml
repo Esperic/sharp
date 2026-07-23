@@ -39,6 +39,7 @@ pl_module:
     gmp_condition_memory: true
     use_gmp_prior_logit_bias: true
     gmp_prior_logit_bias_weight: 0.05
+    gmp_anchor_residual: false
     use_endpoint_diversity: false
     drift_weight: 0.05
     drift_warmup_epochs: 5

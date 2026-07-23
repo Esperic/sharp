@@ -60,12 +60,14 @@ class BaseLightningModule(pl.LightningModule):
         # actors remain in x_attr as scene context, but receive no target loss.
         return data['x_attr'][:, 0, 2].long() == 0
     
-    def load_chkpt(self, ckpt_path, multi=False):
+    def load_chkpt(self, ckpt_path, multi=False, reset_anchor_residual=False):
         ckpt = torch.load(ckpt_path, map_location="cpu")["state_dict"]
         state_dict = {
             k[len("model.") :]: v for k, v in ckpt.items() if k.startswith("model.")
         }
         incompatible = self.model.load_state_dict(state_dict=state_dict, strict=False)
+        if reset_anchor_residual and getattr(self.model, 'gmp_anchor_residual', False):
+            self.model.reset_anchor_residual_heads()
         if multi:
             state_dict = {
                 k[len("consitency_module.") :]: v for k, v in ckpt.items() if k.startswith("consitency_module.")
@@ -155,8 +157,13 @@ class BaseLightningModule(pl.LightningModule):
         if use_mdf and not configured_use_drift_loss:
             rank_zero_warn('use_mdf=True has no effect when use_drift_loss=False')
 
+        winner_predictions = (
+            out['gmp_anchor_trajs'][:, :, :gt_len]
+            if getattr(self.model, 'gmp_anchor_residual', False)
+            else y_hat[..., :2]
+        )
         best_mode = select_winner(
-            y_hat[..., :2],
+            winner_predictions,
             y,
             metric=getattr(self.model, 'winner_metric', 'l2_sum'),
             fde_weight=getattr(self.model, 'winner_fde_weight', 1.0),
@@ -191,11 +198,15 @@ class BaseLightningModule(pl.LightningModule):
         )
 
         if new_y_hat is not None:
-            new_best_mode = select_winner(
-                new_y_hat[..., :2],
-                y,
-                metric=getattr(self.model, 'winner_metric', 'l2_sum'),
-                fde_weight=getattr(self.model, 'winner_fde_weight', 1.0),
+            new_best_mode = (
+                best_mode
+                if getattr(self.model, 'gmp_anchor_residual', False)
+                else select_winner(
+                    new_y_hat[..., :2],
+                    y,
+                    metric=getattr(self.model, 'winner_metric', 'l2_sum'),
+                    fde_weight=getattr(self.model, 'winner_fde_weight', 1.0),
+                )
             )
             new_y_hat_best = new_y_hat[torch.arange(new_y_hat.shape[0]), new_best_mode]
             new_trajectory_reg_loss = (

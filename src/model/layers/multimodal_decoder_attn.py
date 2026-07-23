@@ -146,6 +146,14 @@ class MultimodalDecoder(nn.Module):
                     intention_query = intention_query.view(B, self.k, self.embed_dim) 
 
         loc = self.loc(intention_query).view(B, self.k, self.future_steps, 2)
+        if self.use_gmp and gmp_aux is not None and gmp_aux.get("anchor_trajs") is not None:
+            anchor_trajs = gmp_aux["anchor_trajs"]
+            if anchor_trajs.shape != loc.shape:
+                raise RuntimeError(
+                    f"GMP anchor shape {tuple(anchor_trajs.shape)} does not match "
+                    f"decoder trajectory shape {tuple(loc.shape)}"
+                )
+            loc = loc + anchor_trajs
         pi = self.pi(intention_query).squeeze(2)
         if self.use_gmp and gmp_aux is not None and gmp_aux.get("pi_bias") is not None:
             pi_bias = gmp_aux["pi_bias"]

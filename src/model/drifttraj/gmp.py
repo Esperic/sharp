@@ -22,6 +22,8 @@ class GaussianMixturePrior(nn.Module):
         condition_memory: bool = False,
         use_prior_logit_bias: bool = True,
         latent_dim: int = 16,
+        anchor_residual: bool = False,
+        future_steps: Optional[int] = None,
     ) -> None:
         super().__init__()
         if path is None:
@@ -31,6 +33,8 @@ class GaussianMixturePrior(nn.Module):
             raise FileNotFoundError(f"GMP parameter file does not exist: {path}")
         if sampling not in {"query_aligned", "random", "prior_topk"}:
             raise ValueError(f"Unsupported gmp_sampling={sampling}")
+        if anchor_residual and future_steps is None:
+            raise ValueError("future_steps is required when gmp_anchor_residual=True")
 
         payload = np.load(path_obj, allow_pickle=False)
         center_points = torch.as_tensor(payload["center_points"], dtype=torch.float32)
@@ -66,6 +70,11 @@ class GaussianMixturePrior(nn.Module):
         self.k = int(k)
         self.num_types = int(center_points.shape[0])
         self.gmp_k = int(center_points.shape[1])
+        if anchor_residual and self.gmp_k != self.k:
+            raise ValueError(
+                "Anchor residual mode requires one anchor per decoder mode; "
+                f"got GMP K={self.gmp_k}, model K={self.k}"
+            )
         self.embed_dim = int(embed_dim)
         self.latent_dim = int(latent_dim)
         self.sampling = sampling
@@ -75,6 +84,7 @@ class GaussianMixturePrior(nn.Module):
         self.condition_pi = bool(condition_pi)
         self.condition_memory = bool(condition_memory)
         self.use_prior_logit_bias = bool(use_prior_logit_bias)
+        self.anchor_residual = bool(anchor_residual)
         self.metadata = {}
         if "metadata" in payload.files:
             try:
@@ -86,8 +96,50 @@ class GaussianMixturePrior(nn.Module):
         self.register_buffer("center_std", center_std, persistent=True)
         self.register_buffer("mixture_weights", mixture_weights, persistent=True)
 
+        if self.anchor_residual:
+            if self.sampling == "random":
+                raise ValueError("gmp_sampling=random is incompatible with stable anchor mode identities")
+            if "cluster_trajs_raw" not in payload.files:
+                raise ValueError("GMP anchor residual mode requires cluster_trajs_raw in the parameter file")
+            cluster_trajs_raw = torch.as_tensor(payload["cluster_trajs_raw"], dtype=torch.float32)
+            cluster_trajs = torch.as_tensor(
+                payload["cluster_trajs"] if "cluster_trajs" in payload.files else payload["cluster_trajs_raw"],
+                dtype=torch.float32,
+            )
+            if cluster_trajs_raw.ndim == 3:
+                cluster_trajs_raw = cluster_trajs_raw.unsqueeze(0)
+                cluster_trajs = cluster_trajs.unsqueeze(0)
+            expected_prefix = (self.num_types, self.gmp_k)
+            if (
+                cluster_trajs_raw.ndim != 4
+                or cluster_trajs.shape != cluster_trajs_raw.shape
+                or cluster_trajs_raw.shape[:2] != expected_prefix
+                or cluster_trajs_raw.shape[-1] != 2
+            ):
+                raise ValueError(
+                    "cluster_trajs(_raw) must share [C,K,T,2] with the GMP; "
+                    f"got {tuple(cluster_trajs.shape)} and {tuple(cluster_trajs_raw.shape)}"
+                )
+            if future_steps is not None and cluster_trajs_raw.shape[2] != int(future_steps):
+                raise ValueError(
+                    f"GMP anchors have T={cluster_trajs_raw.shape[2]}, expected future_steps={future_steps}"
+                )
+            if not torch.isfinite(cluster_trajs_raw).all() or not torch.isfinite(cluster_trajs).all():
+                raise ValueError("GMP trajectory anchors contain non-finite values")
+            self.register_buffer("cluster_trajs", cluster_trajs, persistent=True)
+            self.register_buffer("cluster_trajs_raw", cluster_trajs_raw, persistent=True)
+
         self.gmp_xy_to_latent = nn.Linear(2, self.latent_dim)
         self.gmp_query_proj = nn.Linear(self.latent_dim, embed_dim)
+        self.gmp_traj_query_proj = (
+            nn.Sequential(
+                nn.Linear(int(future_steps) * 2, embed_dim),
+                nn.GELU(),
+                nn.Linear(embed_dim, embed_dim),
+            )
+            if self.anchor_residual and future_steps is not None
+            else None
+        )
         self.gmp_pi_proj = nn.Sequential(
             nn.Linear(self.latent_dim, embed_dim),
             nn.GELU(),
@@ -99,7 +151,10 @@ class GaussianMixturePrior(nn.Module):
         self._freeze_disabled_conditioners()
 
     def _init_conditioners(self) -> None:
-        for module in (self.gmp_xy_to_latent, self.gmp_query_proj, self.gmp_pi_proj, self.gmp_memory_film):
+        modules = [self.gmp_xy_to_latent, self.gmp_query_proj, self.gmp_pi_proj, self.gmp_memory_film]
+        if self.gmp_traj_query_proj is not None:
+            modules.append(self.gmp_traj_query_proj)
+        for module in modules:
             for layer in module.modules():
                 if isinstance(layer, nn.Linear):
                     nn.init.xavier_uniform_(layer.weight)
@@ -113,9 +168,15 @@ class GaussianMixturePrior(nn.Module):
             param.requires_grad = trainable
 
     def _freeze_disabled_conditioners(self) -> None:
-        uses_latent = self.condition_query or self.condition_pi or self.condition_memory
+        uses_latent = (
+            (self.condition_query and not self.anchor_residual)
+            or self.condition_pi
+            or self.condition_memory
+        )
         self._set_trainable(self.gmp_xy_to_latent, uses_latent)
-        self._set_trainable(self.gmp_query_proj, self.condition_query)
+        self._set_trainable(self.gmp_query_proj, self.condition_query and not self.anchor_residual)
+        if self.gmp_traj_query_proj is not None:
+            self._set_trainable(self.gmp_traj_query_proj, self.condition_query)
         self._set_trainable(self.gmp_pi_proj, self.condition_pi)
         self._set_trainable(self.gmp_memory_film, self.condition_memory)
         self._set_trainable(self.gmp_memory_norm, self.condition_memory)
@@ -190,6 +251,26 @@ class GaussianMixturePrior(nn.Module):
         if xy.shape[-1] != 2:
             raise ValueError(f"GMP xy must end in 2, got {tuple(xy.shape)}")
         return self.gmp_query_proj(self.xy_to_latent(xy))
+
+    def trajectory_anchors(
+        self,
+        comp_idx: torch.Tensor,
+        target_types: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not self.anchor_residual:
+            raise RuntimeError("Trajectory anchors are available only when gmp_anchor_residual=True")
+        type_idx = self._type_indices(comp_idx.shape[0], comp_idx.device, target_types)
+        batch_idx = torch.arange(comp_idx.shape[0], device=comp_idx.device).unsqueeze(1)
+        normalized = self.cluster_trajs.to(comp_idx.device)[type_idx][batch_idx, comp_idx]
+        raw = self.cluster_trajs_raw.to(comp_idx.device)[type_idx][batch_idx, comp_idx]
+        return raw, normalized
+
+    def trajectory_to_query_delta(self, trajectories: torch.Tensor) -> torch.Tensor:
+        if not self.condition_query:
+            return trajectories.new_zeros(*trajectories.shape[:2], self.embed_dim)
+        if self.gmp_traj_query_proj is None:
+            raise RuntimeError("Trajectory query projection is not initialized")
+        return self.gmp_traj_query_proj(trajectories.flatten(start_dim=2))
 
     def xy_to_pi_bias(
         self,
