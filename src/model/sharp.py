@@ -126,7 +126,7 @@ class Sharp_I(nn.Module):
         return self.load_state_dict(state_dict=state_dict, strict=False)
 
 
-    def _build_gmp_aux(self, batch_size, device):
+    def _build_gmp_aux(self, data, batch_size, device):
         return None
 
 
@@ -296,7 +296,7 @@ class Sharp_I(nn.Module):
 
         # add positional embedding to scene encoding after computation of the target-centric features is done
         x_encoder = x_encoder + pos_embed
-        gmp_aux = self._build_gmp_aux(B, x_encoder.device)
+        gmp_aux = self._build_gmp_aux(data, B, x_encoder.device)
         if gmp_aux is not None:
             x_encoder = self.gmp_prior.memory_film(x_encoder, gmp_aux['xy'])
             assert_finite_tensor("gmp_query_delta", gmp_aux["query_delta"])
@@ -485,7 +485,7 @@ class Sharp(Sharp_I):
                  gmp_std_floor=0.05,
                  gmp_sampling="query_aligned",
                  gmp_train_noise_scale=1.0,
-                 gmp_eval_noise_scale=1.0,
+                 gmp_eval_noise_scale=0.0,
                  gmp_latent_dim=16,
                  gmp_use_center_points=True,
                  gmp_use_cluster_trajs_for_init=True,
@@ -513,6 +513,9 @@ class Sharp(Sharp_I):
                  drift_context_alpha=1.0,
                  winner_metric="l2_sum",
                  winner_fde_weight=1.0,
+                 endpoint_reg_weight=0.0,
+                 dual_loss_weight=1.0,
+                 others_loss_weight=1.0,
                  mdf_r_list=(0.02, 0.1, 0.5),
                  mdf_normalize_force=True,
                  mdf_positive_weight=1.0,
@@ -559,6 +562,9 @@ class Sharp(Sharp_I):
         self.drift_context_alpha = float(drift_context_alpha)
         self.winner_metric = winner_metric
         self.winner_fde_weight = float(winner_fde_weight)
+        self.endpoint_reg_weight = float(endpoint_reg_weight)
+        self.dual_loss_weight = float(dual_loss_weight)
+        self.others_loss_weight = float(others_loss_weight)
         self.mdf_r_list = list(mdf_r_list)
         self.mdf_normalize_force = bool(mdf_normalize_force)
         self.mdf_positive_weight = float(mdf_positive_weight)
@@ -688,17 +694,22 @@ class Sharp(Sharp_I):
             for name, param in self.named_parameters():
                 print("grad", name)
 
-    def _build_gmp_aux(self, batch_size, device):
+    def _build_gmp_aux(self, data, batch_size, device):
         if not self.use_gmp or self.gmp_prior is None:
             return None
+        target_types = data['x_attr'][:, 0, 2].long().to(device)
         gmp_xy, gmp_comp_idx = self.gmp_prior.sample_xy(
             batch_size=batch_size,
             num_queries=self.k,
             device=device,
             training=self.training,
+            target_types=target_types,
         )
         query_delta = self.gmp_prior.xy_to_query_delta(gmp_xy)
-        pi_bias = self.gmp_prior.xy_to_pi_bias(gmp_xy, gmp_comp_idx) if self.gmp_condition_pi else None
+        pi_bias = (
+            self.gmp_prior.xy_to_pi_bias(gmp_xy, gmp_comp_idx, target_types)
+            if self.gmp_condition_pi else None
+        )
         return {
             'xy': gmp_xy,
             'comp_idx': gmp_comp_idx,

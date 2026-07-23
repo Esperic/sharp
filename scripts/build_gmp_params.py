@@ -13,6 +13,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+AV2_TARGET_TYPES = {0: "vehicle", 1: "pedestrian", 2: "two_wheeler"}
+
 
 def _load_torch(path):
     if Path(path).suffix in {".pkl", ".pickle"}:
@@ -75,14 +77,19 @@ def _rotation_matrix(theta):
     )
 
 
-def _targets_from_av2_scene_dict(sample, future_steps, split_points=(10, 20, 30, 40, 50), num_historical_steps=10):
+def _targets_from_av2_scene_dict(
+    sample,
+    future_steps,
+    split_points=(10, 20, 30, 40, 50),
+    num_historical_steps=10,
+    include_scored=False,
+):
     if not isinstance(sample, dict):
         return []
     required = {"focal_idx", "x_positions", "x_angles", "x_valid_mask", "x_attr"}
     if not required.issubset(sample.keys()):
         return []
 
-    idx = int(sample["focal_idx"])
     x_positions = sample["x_positions"]
     x_angles = sample["x_angles"]
     x_valid_mask = sample["x_valid_mask"]
@@ -96,33 +103,40 @@ def _targets_from_av2_scene_dict(sample, future_steps, split_points=(10, 20, 30,
     if not torch.is_tensor(x_attr):
         x_attr = torch.as_tensor(x_attr)
 
-    if idx >= x_positions.shape[0] or x_positions.shape[-1] != 2:
-        return []
-    if x_attr[idx, -1].item() == 3:
+    if x_positions.shape[-1] != 2:
         return []
 
     trajs = []
     total_steps = x_positions.shape[1]
-    for step in split_points:
-        st = step - num_historical_steps
-        ed = step + future_steps
-        if st < 0 or ed > total_steps:
+    target_indices = [int(sample["focal_idx"])]
+    if include_scored:
+        target_indices = dict.fromkeys([*target_indices, *map(int, sample.get("scored_idx", []))])
+    for idx in target_indices:
+        if idx >= x_positions.shape[0]:
             continue
-        valid = x_valid_mask[idx, st:ed].bool()
-        if valid.shape[0] != num_historical_steps + future_steps:
+        target_type = int(x_attr[idx, -1].item())
+        if target_type not in AV2_TARGET_TYPES:
             continue
-        target_mask = valid[num_historical_steps - 1] & valid[num_historical_steps:]
-        if not bool(target_mask.all()):
-            continue
+        for step in split_points:
+            st = step - num_historical_steps
+            ed = step + future_steps
+            if st < 0 or ed > total_steps:
+                continue
+            valid = x_valid_mask[idx, st:ed].bool()
+            if valid.shape[0] != num_historical_steps + future_steps:
+                continue
+            target_mask = valid[num_historical_steps - 1] & valid[num_historical_steps:]
+            if not bool(target_mask.all()):
+                continue
 
-        origin = x_positions[idx, step - 1]
-        theta = x_angles[idx, step - 1]
-        rot_mat = _rotation_matrix(theta).to(dtype=x_positions.dtype, device=x_positions.device)
-        local = torch.matmul(x_positions[idx, st:ed] - origin, rot_mat)
-        pos_ctr = local[num_historical_steps - 1].clone()
-        target = local[num_historical_steps:] - pos_ctr.unsqueeze(0)
-        if target.shape == (future_steps, 2) and torch.isfinite(target).all():
-            trajs.append(target.float())
+            origin = x_positions[idx, step - 1]
+            theta = x_angles[idx, step - 1]
+            rot_mat = _rotation_matrix(theta).to(dtype=x_positions.dtype, device=x_positions.device)
+            local = torch.matmul(x_positions[idx, st:ed] - origin, rot_mat)
+            pos_ctr = local[num_historical_steps - 1].clone()
+            target = local[num_historical_steps:] - pos_ctr.unsqueeze(0)
+            if target.shape == (future_steps, 2) and torch.isfinite(target).all():
+                trajs.append((target_type, target.float()))
     return trajs
 
 
@@ -172,6 +186,7 @@ def iter_future_trajs(
     dry_run=False,
     dry_run_samples=16,
     progress=True,
+    by_agent_type=False,
 ):
     root = Path(processed_root)
     files = sorted(root.glob("*.pt")) + sorted(root.glob("*.pkl")) + sorted(root.glob("*.pickle"))
@@ -186,6 +201,7 @@ def iter_future_trajs(
                 print(f"sample_keys={sorted(sample.keys())}")
 
     count = 0
+    type_counts = {target_type: 0 for target_type in AV2_TARGET_TYPES}
     file_limit = dry_run_samples if dry_run else None
     if dataset == "av2":
         if dry_run:
@@ -207,10 +223,20 @@ def iter_future_trajs(
                     progress_bar.update(1)
                 elif progress and (file_idx == 1 or file_idx % 1000 == 0 or file_idx == len(selected_files)):
                     print(f"extract_av2_futures: {file_idx}/{len(selected_files)} file")
-                for traj in _targets_from_av2_scene_dict(obj, future_steps):
-                    yield traj.numpy()
+                for target_type, traj in _targets_from_av2_scene_dict(
+                    obj,
+                    future_steps,
+                    include_scored=by_agent_type,
+                ):
+                    if by_agent_type and max_samples and type_counts[target_type] >= max_samples:
+                        continue
+                    yield (target_type, traj.numpy()) if by_agent_type else traj.numpy()
+                    type_counts[target_type] += 1
                     count += 1
-                    if max_samples is not None and count >= max_samples:
+                    if max_samples and (
+                        (by_agent_type and all(value >= max_samples for value in type_counts.values()))
+                        or (not by_agent_type and count >= max_samples)
+                    ):
                         return
         finally:
             if progress_bar is not None:
@@ -335,6 +361,37 @@ def build_gmp(trajs, k, std_floor, seed, normalize):
     }
 
 
+def build_type_specific_gmp(typed_trajs, k, std_floor, seed, normalize):
+    grouped = {target_type: [] for target_type in AV2_TARGET_TYPES}
+    for target_type, traj in typed_trajs:
+        if target_type in grouped:
+            grouped[target_type].append(traj)
+    missing = [AV2_TARGET_TYPES[key] for key, values in grouped.items() if len(values) < k]
+    if missing:
+        raise ValueError(f"Need at least k={k} trajectories for each AV2 target type; missing: {missing}")
+
+    per_type = [
+        build_gmp(np.stack(grouped[target_type]).astype(np.float32), k, std_floor, seed + target_type, normalize)
+        for target_type in AV2_TARGET_TYPES
+    ]
+    fields = (
+        "center_points",
+        "center_std",
+        "center_points_raw",
+        "center_std_raw",
+        "mixture_weights",
+        "cluster_trajs",
+        "cluster_trajs_raw",
+        "counts",
+        "endpoint_order",
+    )
+    return {
+        **{field: np.stack([params[field] for params in per_type]) for field in fields},
+        "normalization": [params["normalization"] for params in per_type],
+        "num_samples": [len(grouped[target_type]) for target_type in AV2_TARGET_TYPES],
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--processed_root", required=True)
@@ -349,7 +406,14 @@ def main():
     parser.add_argument("--dry_run_samples", type=int, default=16)
     parser.add_argument("--no_progress", action="store_true")
     parser.add_argument("--normalize", choices=["none", "mean_range"], default="none")
+    parser.add_argument(
+        "--by_agent_type",
+        action="store_true",
+        help="Build independent AV2 GMPs for vehicle, pedestrian and two-wheeler targets.",
+    )
     args = parser.parse_args()
+    if args.by_agent_type and args.dataset != "av2":
+        parser.error("--by_agent_type is supported only for AV2")
 
     trajs = list(iter_future_trajs(
         args.processed_root,
@@ -359,26 +423,39 @@ def main():
         dry_run=args.dry_run,
         dry_run_samples=args.dry_run_samples,
         progress=not args.no_progress,
+        by_agent_type=args.by_agent_type,
     ))
     if not trajs:
         raise RuntimeError("No valid full-length training future trajectories were extracted.")
-    trajs = np.stack(trajs).astype(np.float32)
-    print(f"extracted_trajs={trajs.shape}")
-    print(f"traj_range=[{trajs.min():.4f}, {trajs.max():.4f}]")
+    if args.by_agent_type:
+        type_counts = {
+            AV2_TARGET_TYPES[target_type]: sum(item_type == target_type for item_type, _ in trajs)
+            for target_type in AV2_TARGET_TYPES
+        }
+        print(f"extracted_trajs_by_type={type_counts}")
+    else:
+        trajs = np.stack(trajs).astype(np.float32)
+        print(f"extracted_trajs={trajs.shape}")
+        print(f"traj_range=[{trajs.min():.4f}, {trajs.max():.4f}]")
     if args.dry_run:
         print("dry_run=true; not saving GMP params")
         return
 
-    params = build_gmp(trajs, args.k, args.std_floor, args.seed, args.normalize)
+    params = (
+        build_type_specific_gmp(trajs, args.k, args.std_floor, args.seed, args.normalize)
+        if args.by_agent_type
+        else build_gmp(trajs, args.k, args.std_floor, args.seed, args.normalize)
+    )
     metadata = {
         "dataset": args.dataset,
         "future_steps": args.future_steps,
         "k": args.k,
-        "num_samples": int(trajs.shape[0]),
+        "num_samples": params["num_samples"] if args.by_agent_type else int(trajs.shape[0]),
         "std_floor": args.std_floor,
         "seed": args.seed,
         "processed_root": str(Path(args.processed_root)),
         "normalization": params["normalization"],
+        "agent_types": list(AV2_TARGET_TYPES.values()) if args.by_agent_type else None,
     }
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -391,6 +468,8 @@ def main():
         mixture_weights=params["mixture_weights"],
         cluster_trajs=params["cluster_trajs"],
         cluster_trajs_raw=params["cluster_trajs_raw"],
+        agent_type_ids=np.asarray(list(AV2_TARGET_TYPES), dtype=np.int64) if args.by_agent_type else np.asarray([]),
+        agent_type_names=np.asarray(list(AV2_TARGET_TYPES.values())) if args.by_agent_type else np.asarray([]),
         metadata=json.dumps(metadata),
     )
     sidecar = output.with_suffix(".json")

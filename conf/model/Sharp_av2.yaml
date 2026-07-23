@@ -3,6 +3,8 @@ tag: Sharp
 pl_module:
   _target_: src.model.pl_modules.StreamLightningModule
   num_grad_frame: 10
+  step_loss_weights: [0.1, 0.2, 0.4, 0.7, 1.0]
+  final_step_only_start_epoch: 10
   model:
     _target_: src.model.sharp.Sharp
     embed_dim: 128
@@ -19,7 +21,7 @@ pl_module:
     biased_interaction: True
     dm: av2
     k: 6
-    vehicle_only: true
+    vehicle_only: false
     use_gmp: false
     use_drift_loss: false
     use_mdf: false
@@ -28,7 +30,7 @@ pl_module:
     gmp_std_floor: 0.05
     gmp_sampling: query_aligned
     gmp_train_noise_scale: 1.0
-    gmp_eval_noise_scale: 1.0
+    gmp_eval_noise_scale: 0.0
     gmp_latent_dim: 16
     gmp_use_center_points: true
     gmp_use_cluster_trajs_for_init: true
@@ -54,8 +56,11 @@ pl_module:
     drift_num_waypoints: 10
     drift_endpoint_weight: 2.0
     drift_context_alpha: 1.0
-    winner_metric: l2_sum
+    winner_metric: ade_fde
     winner_fde_weight: 1.0
+    endpoint_reg_weight: 1.0
+    dual_loss_weight: 0.25
+    others_loss_weight: 0.1
     mdf_r_list: [0.02, 0.05, 0.2]
     mdf_normalize_force: true
     mdf_positive_weight: 1.0

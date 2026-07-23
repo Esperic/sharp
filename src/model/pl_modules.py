@@ -155,23 +155,26 @@ class BaseLightningModule(pl.LightningModule):
         if use_mdf and not configured_use_drift_loss:
             rank_zero_warn('use_mdf=True has no effect when use_drift_loss=False')
 
-        if extra_training_loss_active:
-            best_mode = select_winner(
-                y_hat[..., :2],
-                y,
-                metric=getattr(self.model, 'winner_metric', 'l2_sum'),
-                fde_weight=getattr(self.model, 'winner_fde_weight', 1.0),
-            )
-        else:
-            l2_norm = torch.norm(y_hat[..., :2] - y.unsqueeze(1), dim=-1).sum(dim=-1)
-            best_mode = torch.argmin(l2_norm, dim=-1)
+        best_mode = select_winner(
+            y_hat[..., :2],
+            y,
+            metric=getattr(self.model, 'winner_metric', 'l2_sum'),
+            fde_weight=getattr(self.model, 'winner_fde_weight', 1.0),
+        )
         y_hat_best = y_hat[torch.arange(y_hat.shape[0]), best_mode]
         zero_loss = y_hat.sum() * 0.0
-        agent_reg_loss = (
+        trajectory_reg_loss = (
             F.smooth_l1_loss(y_hat_best[target_sample_mask, ..., :2], y[target_sample_mask])
             if target_sample_mask.any()
             else zero_loss
         )
+        endpoint_reg_loss = (
+            F.smooth_l1_loss(y_hat_best[target_sample_mask, -1, :2], y[target_sample_mask, -1])
+            if target_sample_mask.any()
+            else zero_loss
+        )
+        endpoint_reg_weight = getattr(self.model, 'endpoint_reg_weight', 0.0)
+        agent_reg_loss = trajectory_reg_loss + endpoint_reg_weight * endpoint_reg_loss
         label_smoothing = (
             getattr(self.model, 'label_smoothing', 0.0)
             if getattr(self.model, 'use_label_smoothing_ce', False) and extra_training_loss_active
@@ -188,23 +191,29 @@ class BaseLightningModule(pl.LightningModule):
         )
 
         if new_y_hat is not None:
-            if getattr(self.model, 'drift_apply_to_single', False) and extra_training_loss_active:
-                new_best_mode = select_winner(
-                    new_y_hat[..., :2],
-                    y,
-                    metric=getattr(self.model, 'winner_metric', 'l2_sum'),
-                    fde_weight=getattr(self.model, 'winner_fde_weight', 1.0),
-                )
-            else:
-                l2_norm = torch.norm(new_y_hat[..., :2] - y.unsqueeze(1), dim=-1).sum(dim=-1)
-                new_best_mode = torch.argmin(l2_norm, dim=-1)
+            new_best_mode = select_winner(
+                new_y_hat[..., :2],
+                y,
+                metric=getattr(self.model, 'winner_metric', 'l2_sum'),
+                fde_weight=getattr(self.model, 'winner_fde_weight', 1.0),
+            )
             new_y_hat_best = new_y_hat[torch.arange(new_y_hat.shape[0]), new_best_mode]
-            new_agent_reg_loss = (
+            new_trajectory_reg_loss = (
                 F.smooth_l1_loss(
                     new_y_hat_best[target_sample_mask, ..., :2], y[target_sample_mask]
                 )
                 if target_sample_mask.any()
                 else zero_loss
+            )
+            new_endpoint_reg_loss = (
+                F.smooth_l1_loss(
+                    new_y_hat_best[target_sample_mask, -1, :2], y[target_sample_mask, -1]
+                )
+                if target_sample_mask.any()
+                else zero_loss
+            )
+            new_agent_reg_loss = (
+                new_trajectory_reg_loss + endpoint_reg_weight * new_endpoint_reg_loss
             )
             new_agent_cls_loss = (
                 F.cross_entropy(
@@ -216,8 +225,8 @@ class BaseLightningModule(pl.LightningModule):
                 else zero_loss
             )
         else:
-            new_agent_reg_loss = 0
-            new_agent_cls_loss = 0
+            new_agent_reg_loss = zero_loss
+            new_agent_cls_loss = zero_loss
 
         others_reg_mask = data['target_mask'][:, 1:]
         if getattr(self.model, 'vehicle_only', False):
@@ -316,13 +325,27 @@ class BaseLightningModule(pl.LightningModule):
                 f'{tag}diversity_weight': diversity_w,
             })
 
-        loss = agent_reg_loss + agent_cls_loss + others_reg_loss + new_agent_reg_loss + new_agent_cls_loss + extra_loss
+        dual_loss_weight = getattr(self.model, 'dual_loss_weight', 1.0)
+        others_loss_weight = getattr(self.model, 'others_loss_weight', 1.0)
+        loss = (
+            agent_reg_loss
+            + agent_cls_loss
+            + others_loss_weight * others_reg_loss
+            + dual_loss_weight * (new_agent_reg_loss + new_agent_cls_loss)
+            + extra_loss
+        )
         assert_finite_tensor("loss", loss)
         disp_dict = {
             f'{tag}loss': loss.item(),
             f'{tag}reg_loss': agent_reg_loss.item(),
+            f'{tag}trajectory_reg_loss': trajectory_reg_loss.item(),
+            f'{tag}endpoint_reg_loss': endpoint_reg_loss.item(),
             f'{tag}cls_loss': agent_cls_loss.item(),
             f'{tag}others_reg_loss': others_reg_loss.item(),
+            f'{tag}others_loss_weight': others_loss_weight,
+            f'{tag}dual_reg_loss': new_agent_reg_loss.item(),
+            f'{tag}dual_cls_loss': new_agent_cls_loss.item(),
+            f'{tag}dual_loss_weight': dual_loss_weight,
         }
         if 'gmp_comp_idx' in out:
             comp_idx = out['gmp_comp_idx']
@@ -492,9 +515,19 @@ class BaseLightningModule(pl.LightningModule):
 class StreamLightningModule(BaseLightningModule):
     def __init__(self,
                  num_grad_frame=3,
+                 step_loss_weights=None,
+                 final_step_only_start_epoch=None,
                  **kwargs):
         super().__init__(**kwargs)
         self.num_grad_frame = num_grad_frame
+        self.step_loss_weights = (
+            None if step_loss_weights is None else [float(weight) for weight in step_loss_weights]
+        )
+        self.final_step_only_start_epoch = (
+            None if final_step_only_start_epoch is None else int(final_step_only_start_epoch)
+        )
+        if self.step_loss_weights is not None and min(self.step_loss_weights) < 0:
+            raise ValueError("step_loss_weights must be non-negative")
 
         # initialize multi-agent consistency module
         from .ma_consistency_module import GlobalConsistencyModule 
@@ -506,6 +539,10 @@ class StreamLightningModule(BaseLightningModule):
         total_step = len(data)
         num_grad_frames = min(self.num_grad_frame, total_step)
         num_no_grad_frames = total_step - num_grad_frames
+        if self.step_loss_weights is not None and len(self.step_loss_weights) != total_step:
+            raise ValueError(
+                f"step_loss_weights must have {total_step} entries, got {len(self.step_loss_weights)}"
+            )
 
         # iterate over all split points which does not require grad
         memory_dict = None
@@ -522,7 +559,8 @@ class StreamLightningModule(BaseLightningModule):
         sum_loss = 0
         loss_dict = {}
         for i in range(num_grad_frames):
-            cur_data = data[i + num_no_grad_frames]
+            step_idx = i + num_no_grad_frames
+            cur_data = data[step_idx]
             cur_data['memory_dict'] = memory_dict
             out = self(cur_data)
             apply_drift_loss = (
@@ -532,21 +570,31 @@ class StreamLightningModule(BaseLightningModule):
             cur_loss, cur_loss_dict = self.cal_loss(
                 out,
                 cur_data,
-                tag=f'step{i + num_no_grad_frames}_',
+                tag=f'step{step_idx}_',
                 apply_drift_loss=apply_drift_loss,
             )
             loss_dict.update(cur_loss_dict)
             memory_dict = out['memory_dict']
+            step_weight = (
+                self.step_loss_weights[step_idx]
+                if self.step_loss_weights is not None else 1.0
+            )
+            if (
+                self.final_step_only_start_epoch is not None
+                and self.current_epoch >= self.final_step_only_start_epoch
+                and step_idx != total_step - 1
+            ):
+                step_weight = 0.0
+            loss_dict[f'step{step_idx}_loss_weight'] = step_weight
 
             # apply multi-agent consistency
             if self.ma and self.ma_loss_each:
-                sum_loss += cur_loss
                 ma_input = self.getScenario(out, cur_data)
                 scene_out = self.consitency_module(ma_input)
                 cur_data["scored_mask"] = ma_input["x_key_valid_mask"]
                 cur_data["target"] = ma_input["target"]
-                ma_loss, __ = self.cal_loss(scene_out, cur_data, tag=f'step{i + num_no_grad_frames}_', ma=True)
-                sum_loss += ma_loss * 0.9 + cur_loss * 0.1
+                ma_loss, __ = self.cal_loss(scene_out, cur_data, tag=f'step{step_idx}_', ma=True)
+                step_loss = ma_loss * 0.9 + cur_loss * 1.1
                 
                 # stream predictions after consistency module to the following step
                 if self.stream_the_scene:
@@ -556,7 +604,8 @@ class StreamLightningModule(BaseLightningModule):
                     memory_dict["glo_y_hat"] = glo_y_hat.reshape(B, y_hat.size(1), -1, 2)
                     memory_dict["x_mode"] = scene_out["x_mode"].permute(0, 2, 1, 3)[ma_input["x_key_valid_mask"]]
             else:
-                sum_loss += cur_loss
+                step_loss = cur_loss
+            sum_loss += step_weight * step_loss
 
         # unused
         if self.ma and not self.ma_loss_each:

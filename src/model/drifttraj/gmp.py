@@ -7,15 +7,6 @@ import torch
 import torch.nn as nn
 
 
-def _as_tensor(array: np.ndarray, name: str, ndim: int) -> torch.Tensor:
-    tensor = torch.as_tensor(array, dtype=torch.float32)
-    if tensor.ndim != ndim:
-        raise ValueError(f"{name} must have {ndim} dims, got shape {tuple(tensor.shape)}")
-    if not torch.isfinite(tensor).all():
-        raise ValueError(f"{name} contains non-finite values")
-    return tensor
-
-
 class GaussianMixturePrior(nn.Module):
     def __init__(
         self,
@@ -42,25 +33,39 @@ class GaussianMixturePrior(nn.Module):
             raise ValueError(f"Unsupported gmp_sampling={sampling}")
 
         payload = np.load(path_obj, allow_pickle=False)
-        center_points = _as_tensor(payload["center_points"], "center_points", 2)
-        center_std = _as_tensor(payload["center_std"], "center_std", 2).clamp_min(float(std_floor))
-        mixture_weights = _as_tensor(payload["mixture_weights"], "mixture_weights", 1)
-        if center_points.shape[-1] != 2 or center_std.shape[-1] != 2:
-            raise ValueError("center_points and center_std must have shape [K, 2]")
-        if center_points.shape[0] != center_std.shape[0] or center_points.shape[0] != mixture_weights.shape[0]:
+        center_points = torch.as_tensor(payload["center_points"], dtype=torch.float32)
+        center_std = torch.as_tensor(payload["center_std"], dtype=torch.float32).clamp_min(float(std_floor))
+        mixture_weights = torch.as_tensor(payload["mixture_weights"], dtype=torch.float32)
+        if center_points.ndim == 2:
+            center_points = center_points.unsqueeze(0)
+            center_std = center_std.unsqueeze(0)
+            mixture_weights = mixture_weights.unsqueeze(0)
+        if center_points.ndim != 3 or center_std.ndim != 3 or mixture_weights.ndim != 2:
             raise ValueError(
-                "GMP center_points, center_std, and mixture_weights must share the same K; "
-                f"got {center_points.shape[0]}, {center_std.shape[0]}, {mixture_weights.shape[0]}"
+                "GMP arrays must be [K,2]/[K] or type-specific [C,K,2]/[C,K]; "
+                f"got {tuple(center_points.shape)}, {tuple(center_std.shape)}, "
+                f"{tuple(mixture_weights.shape)}"
+            )
+        if not all(torch.isfinite(x).all() for x in (center_points, center_std, mixture_weights)):
+            raise ValueError("GMP arrays contain non-finite values")
+        if center_points.shape[-1] != 2 or center_std.shape[-1] != 2:
+            raise ValueError("center_points and center_std must end in 2")
+        if center_points.shape[:2] != center_std.shape[:2] or center_points.shape[:2] != mixture_weights.shape:
+            raise ValueError(
+                "GMP center_points, center_std, and mixture_weights must share [C,K]; "
+                f"got {tuple(center_points.shape)}, {tuple(center_std.shape)}, "
+                f"{tuple(mixture_weights.shape)}"
             )
 
         mixture_weights = mixture_weights.clamp_min(0)
-        weight_sum = mixture_weights.sum()
-        if weight_sum <= 0:
-            raise ValueError("mixture_weights must contain at least one positive value")
+        weight_sum = mixture_weights.sum(dim=-1, keepdim=True)
+        if (weight_sum <= 0).any():
+            raise ValueError("Each target type must have at least one positive mixture weight")
         mixture_weights = mixture_weights / weight_sum
 
         self.k = int(k)
-        self.gmp_k = int(center_points.shape[0])
+        self.num_types = int(center_points.shape[0])
+        self.gmp_k = int(center_points.shape[1])
         self.embed_dim = int(embed_dim)
         self.latent_dim = int(latent_dim)
         self.sampling = sampling
@@ -115,17 +120,41 @@ class GaussianMixturePrior(nn.Module):
         self._set_trainable(self.gmp_memory_film, self.condition_memory)
         self._set_trainable(self.gmp_memory_norm, self.condition_memory)
 
-    def _component_indices(self, batch_size: int, num_queries: int, device: torch.device) -> torch.Tensor:
-        if self.sampling == "random" and self.training:
-            return torch.multinomial(
-                self.mixture_weights.to(device),
-                num_samples=batch_size * num_queries,
-                replacement=True,
-            ).view(batch_size, num_queries)
+    def _type_indices(
+        self,
+        batch_size: int,
+        device: torch.device,
+        target_types: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if self.num_types == 1:
+            return torch.zeros(batch_size, dtype=torch.long, device=device)
+        if target_types is None:
+            raise ValueError("target_types is required for a type-specific GMP")
+        target_types = torch.as_tensor(target_types, dtype=torch.long, device=device).reshape(-1)
+        if target_types.numel() != batch_size:
+            raise ValueError(f"target_types must have {batch_size} entries, got {target_types.numel()}")
+        if (target_types < 0).any() or (target_types >= self.num_types).any():
+            raise ValueError(
+                f"target_types must be in [0, {self.num_types - 1}], got "
+                f"{target_types.unique().tolist()}"
+            )
+        return target_types
+
+    def _component_indices(
+        self,
+        batch_size: int,
+        num_queries: int,
+        device: torch.device,
+        target_types: torch.Tensor,
+        training: bool,
+    ) -> torch.Tensor:
+        weights = self.mixture_weights.to(device)[target_types]
+        if self.sampling == "random" and training:
+            return torch.multinomial(weights, num_samples=num_queries, replacement=True)
 
         if self.sampling == "prior_topk":
-            order = torch.argsort(self.mixture_weights.to(device), descending=True)
-            base = order[torch.arange(num_queries, device=device) % order.numel()]
+            order = torch.argsort(weights, dim=-1, descending=True)
+            return order[:, torch.arange(num_queries, device=device) % self.gmp_k]
         else:
             base = torch.arange(num_queries, device=device) % self.gmp_k
         return base.view(1, num_queries).repeat(batch_size, 1)
@@ -136,11 +165,14 @@ class GaussianMixturePrior(nn.Module):
         num_queries: int,
         device: torch.device,
         training: Optional[bool] = None,
+        target_types: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         training = self.training if training is None else bool(training)
-        comp_idx = self._component_indices(batch_size, num_queries, device)
-        means = self.center_points.to(device)[comp_idx]
-        std = self.center_std.to(device)[comp_idx]
+        type_idx = self._type_indices(batch_size, device, target_types)
+        comp_idx = self._component_indices(batch_size, num_queries, device, type_idx, training)
+        batch_idx = torch.arange(batch_size, device=device).unsqueeze(1)
+        means = self.center_points.to(device)[type_idx][batch_idx, comp_idx]
+        std = self.center_std.to(device)[type_idx][batch_idx, comp_idx]
         noise_scale = self.train_noise_scale if training else self.eval_noise_scale
         if noise_scale > 0:
             xy = means + torch.randn_like(means) * std * noise_scale
@@ -159,13 +191,19 @@ class GaussianMixturePrior(nn.Module):
             raise ValueError(f"GMP xy must end in 2, got {tuple(xy.shape)}")
         return self.gmp_query_proj(self.xy_to_latent(xy))
 
-    def xy_to_pi_bias(self, xy: torch.Tensor, comp_idx: Optional[torch.Tensor] = None) -> Optional[torch.Tensor]:
+    def xy_to_pi_bias(
+        self,
+        xy: torch.Tensor,
+        comp_idx: Optional[torch.Tensor] = None,
+        target_types: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
         if not self.condition_pi:
             return None
         bias = self.gmp_pi_proj(self.xy_to_latent(xy)).squeeze(-1)
         if self.use_prior_logit_bias and comp_idx is not None:
-            log_w = torch.log(self.mixture_weights.to(xy.device).clamp_min(1e-8))
-            bias = bias + log_w[comp_idx]
+            type_idx = self._type_indices(xy.shape[0], xy.device, target_types)
+            weights = self.mixture_weights.to(xy.device)[type_idx]
+            bias = bias + torch.log(weights.gather(1, comp_idx).clamp_min(1e-8))
         return bias
 
     def xy_to_latent(self, xy: torch.Tensor) -> torch.Tensor:
