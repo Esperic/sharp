@@ -11,7 +11,7 @@ import numpy as np
 from av2.datasets.motion_forecasting.data_schema import ArgoverseScenario, ObjectType
 from av2.map.map_api import ArgoverseStaticMap
 from av2.utils.typing import NDArrayFloat, NDArrayInt
-from matplotlib.collections import LineCollection
+from matplotlib.collections import LineCollection, PolyCollection
 from matplotlib.colors import to_rgba
 from matplotlib.legend_handler import HandlerLineCollection
 from matplotlib.patches import Rectangle
@@ -29,7 +29,7 @@ _ESTIMATED_CYCLIST_WIDTH_M: Final[float] = 0.6
 _PLOT_BOUNDS_BUFFER_W: Final[float] = 48
 _PLOT_BOUNDS_BUFFER_H: Final[float] = 44
 
-_DRIVABLE_AREA_COLOR: Final[str] = "#F1F4F5"
+_DRIVABLE_AREA_COLOR: Final[str] = "#F7F9FA"
 _LANE_SEGMENT_COLOR: Final[str] = "#AEBAC1"
 _CROSSWALK_COLOR: Final[str] = "#C3CACF"
 _DEFAULT_ACTOR_COLOR: Final[str] = "#AFC3D0"
@@ -38,10 +38,12 @@ _PEDESTRIAN_COLOR: Final[str] = "#C59A6C"
 _CONTEXT_ACTOR_EDGE_COLOR: Final[str] = "#708593"
 _FOCAL_AGENT_COLOR: Final[str] = "#244A6B"
 _HISTORY_COLOR: Final[str] = "#2F5673"
-_GROUND_TRUTH_COLOR: Final[str] = "#3C8D86"
+_CONTEXT_HISTORY_COLOR: Final[str] = "#3F5968"
 _BEST_PREDICTION_COLOR: Final[str] = "#C96A50"
 _OTHER_PREDICTION_COLOR: Final[str] = "#7986A6"
 _OTHER_ENDPOINT_COLOR: Final[str] = "#5F6D8E"
+_GT_RIBBON_COLOR: Final[str] = "#3C8D86"
+_GT_ENDPOINT_COLOR: Final[str] = "#3C8D86"
 _BOUNDING_BOX_ZORDER: Final[int] = 100
 
 _STATIC_OBJECT_TYPES: Set[ObjectType] = {
@@ -75,9 +77,19 @@ def visualize_scenario(
 
     # Plot static map elements and actor tracks
     if show_map: _plot_static_map_elements(scenario_static_map, True)
-    plot_bounds, focal_history, focal_gt = _plot_actor_tracks(
+    plot_bounds, focal_gt = _plot_actor_tracks(
         ax, scenario, timestep, show_history, show_future, show_map
     )
+    if show_future and focal_gt is not None:
+        _plot_fading_ribbon(
+            ax,
+            focal_gt,
+            width_m=1.8,
+            color=_GT_RIBBON_COLOR,
+            alpha_start=0.62,
+            alpha_end=0.18,
+            zorder=30,
+        )
 
     other_modes = None
     best_endpoint = None
@@ -88,8 +100,8 @@ def visualize_scenario(
             ax,
             color=_OTHER_PREDICTION_COLOR,
             grad_color=False,
-            alpha=0.38,
-            linewidth=1.0,
+            alpha=0.6,
+            linewidth=1.7,
             zorder=1000,
             arrow=False,
         )
@@ -100,41 +112,12 @@ def visualize_scenario(
                 color=_BEST_PREDICTION_COLOR,
                 grad_color=False,
                 alpha=1.0,
-                linewidth=2.6,
+                linewidth=2.55,
                 linestyle="-",
                 zorder=1010,
                 arrow=False,
-                halo=True,
-                halo_width=1.25,
             )
             best_endpoint = prediction[best_pred, -1]
-
-    if show_future and focal_gt is not None and len(focal_gt):
-        _scatter_polylines(
-            [focal_gt],
-            ax,
-            color=_GROUND_TRUTH_COLOR,
-            grad_color=False,
-            linewidth=2.20,
-            linestyle=(0, (3.2, 1.8)),
-            arrow=False,
-            alpha=1.0,
-            zorder=1012,
-            halo=False,
-        )
-
-    if focal_history is not None and len(focal_history):
-        current_position = focal_history[-1]
-        ax.scatter(
-            current_position[0],
-            current_position[1],
-            s=24,
-            marker="o",
-            facecolors="white",
-            edgecolors=_FOCAL_AGENT_COLOR,
-            linewidths=1.25,
-            zorder=1020,
-        )
 
     if other_modes is not None and len(other_modes):
         ax.scatter(
@@ -159,22 +142,22 @@ def visualize_scenario(
         ax.scatter(
             gt_endpoint[0],
             gt_endpoint[1],
-            s=44,
+            s=46,
             marker="D",
-            facecolors=_GROUND_TRUTH_COLOR,
+            facecolors=_GT_ENDPOINT_COLOR,
             edgecolors="white",
             linewidths=0.7,
-            zorder=1018,
+            zorder=1017,
         )
         ax.scatter(
             best_endpoint[0],
             best_endpoint[1],
-            s=20,
+            s=22,
             marker="o",
             facecolors=_BEST_PREDICTION_COLOR,
-            edgecolors="#914936",
-            linewidths=0.5,
-            zorder=1019,
+            edgecolors="white",
+            linewidths=0.55,
+            zorder=1018,
         )
     else:
         if best_endpoint is not None:
@@ -201,13 +184,13 @@ def visualize_scenario(
             ax.scatter(
                 gt_endpoint[0],
                 gt_endpoint[1],
-                s=34,
+                s=32,
                 marker="D",
-                facecolors=_GROUND_TRUTH_COLOR,
+                facecolors=_GT_ENDPOINT_COLOR,
                 edgecolors="white",
-                linewidths=0.8,
+                linewidths=0.75,
                 alpha=1.0,
-                zorder=1019,
+                zorder=1017,
             )
 
     ax.set_aspect("equal", adjustable="box")
@@ -223,6 +206,38 @@ def visualize_scenario(
         plt.savefig(save_path, dpi=300, pad_inches=0)
         plt.close()
     if create_fig: return fig
+
+
+def _plot_fading_ribbon(
+    ax,
+    trajectory,
+    width_m=1.8,
+    color="#3C8D86",
+    alpha_start=0.62,
+    alpha_end=0.18,
+    zorder=30,
+):
+    """Draw a vehicle-width GT ribbon fading from current to future."""
+    xy = np.asarray(trajectory, dtype=float)[:, :2]
+    if len(xy) < 2:
+        return
+
+    tangent = np.gradient(xy, axis=0)
+    tangent /= np.clip(np.linalg.norm(tangent, axis=1, keepdims=True), 1e-6, None)
+    normal = np.column_stack((-tangent[:, 1], tangent[:, 0]))
+    half_width = width_m / 2.0
+    left, right = xy + half_width * normal, xy - half_width * normal
+    quads = np.stack([left[:-1], left[1:], right[1:], right[:-1]], axis=1)
+    alphas = np.linspace(alpha_start, alpha_end, len(quads))
+    ax.add_collection(
+        PolyCollection(
+            quads,
+            facecolors=[to_rgba(color, alpha) for alpha in alphas],
+            edgecolors="none",
+            antialiased=True,
+            zorder=zorder,
+        )
+    )
 
 
 def _plot_static_map_elements(
@@ -269,7 +284,7 @@ def _plot_actor_tracks(
     show_history: bool,
     show_future: bool,
     show_map: bool
-) -> Tuple[Optional[NDArrayFloat], Optional[NDArrayFloat], Optional[NDArrayFloat]]:
+) -> Tuple[Optional[NDArrayFloat], Optional[NDArrayFloat]]:
     """Plot all actor tracks (up to a particular time step) associated with an Argoverse scenario.
 
     Args:
@@ -281,7 +296,6 @@ def _plot_actor_tracks(
         track_bounds: (x_min, x_max, y_min, y_max) bounds for the extent of actor tracks.
     """
     track_bounds = None
-    focal_history = None
     focal_future = None
     focal_id = scenario.focal_track_id
 
@@ -327,7 +341,6 @@ def _plot_actor_tracks(
 
         is_focal = track.track_id == focal_id
         if is_focal:
-            focal_history = history_trajectory
             if len(future_trajectory) > 0:
                 focal_future = future_trajectory
             track_bounds = history_trajectory[-1]
@@ -344,6 +357,20 @@ def _plot_actor_tracks(
                 arrow=False,
                 alpha=0.92,
                 zorder=998,
+            )
+        elif (
+            show_history
+            and track.object_type == ObjectType.VEHICLE
+            and len(history_trajectory) > 1
+        ):
+            _scatter_polylines(
+                [history_trajectory[-20:]],
+                color=_CONTEXT_HISTORY_COLOR,
+                grad_color=False,
+                linewidth=1.25,
+                arrow=False,
+                alpha=0.68,
+                zorder=190,
             )
 
         if is_focal:
@@ -390,7 +417,7 @@ def _plot_actor_tracks(
                 zorder=1030 if is_focal else 200,
             )
 
-    return track_bounds, focal_history, focal_future
+    return track_bounds, focal_future
 
 
 class HandlerColorLineCollection(HandlerLineCollection):
