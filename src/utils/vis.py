@@ -29,21 +29,23 @@ _ESTIMATED_CYCLIST_WIDTH_M: Final[float] = 0.6
 _PLOT_BOUNDS_BUFFER_W: Final[float] = 48
 _PLOT_BOUNDS_BUFFER_H: Final[float] = 44
 
-_DRIVABLE_AREA_COLOR: Final[str] = "#F7F9FA"
-_LANE_SEGMENT_COLOR: Final[str] = "#AEBAC1"
-_CROSSWALK_COLOR: Final[str] = "#C3CACF"
-_DEFAULT_ACTOR_COLOR: Final[str] = "#AFC3D0"
-_CYCLIST_COLOR: Final[str] = "#8EB69E"
-_PEDESTRIAN_COLOR: Final[str] = "#C59A6C"
-_CONTEXT_ACTOR_EDGE_COLOR: Final[str] = "#708593"
-_FOCAL_AGENT_COLOR: Final[str] = "#244A6B"
-_HISTORY_COLOR: Final[str] = "#2F5673"
-_CONTEXT_HISTORY_COLOR: Final[str] = "#3F5968"
+_CANVAS_COLOR: Final[str] = "#FCFBF8"
+_DRIVABLE_AREA_COLOR: Final[str] = "#F1F1F1"
+_LANE_SEGMENT_COLOR: Final[str] = "#BFC8CC"
+_CROSSWALK_COLOR: Final[str] = "#D7D0C4"
+_DEFAULT_ACTOR_COLOR: Final[str] = "#9CB1BDDA"
+_CYCLIST_COLOR: Final[str] = "#82A996"
+_PEDESTRIAN_COLOR: Final[str] = "#C49362"
+_CONTEXT_ACTOR_EDGE_COLOR: Final[str] = "#718794"
+_FOCAL_AGENT_COLOR: Final[str] = "#253F59"
+_FOCAL_AGENT_EDGE_COLOR: Final[str] = "#182E43"
+_HISTORY_COLOR: Final[str] = "#426985E1"
+_CONTEXT_HISTORY_COLOR: Final[str] = "#718794"
 _BEST_PREDICTION_COLOR: Final[str] = "#C96A50"
-_OTHER_PREDICTION_COLOR: Final[str] = "#7986A6"
-_OTHER_ENDPOINT_COLOR: Final[str] = "#5F6D8E"
-_GT_RIBBON_COLOR: Final[str] = "#3C8D86"
-_GT_ENDPOINT_COLOR: Final[str] = "#3C8D86"
+_OTHER_PREDICTION_COLOR = "#7C83B9"
+_OTHER_ENDPOINT_COLOR = "#5F679C"
+_GT_RIBBON_COLOR: Final[str] = "#479DBE"
+_GT_CENTERLINE_COLOR: Final[str] = "#4A968E"
 _BOUNDING_BOX_ZORDER: Final[int] = 100
 
 _STATIC_OBJECT_TYPES: Set[ObjectType] = {
@@ -72,6 +74,8 @@ def visualize_scenario(
         fig, ax = plt.subplots(1, 1, figsize=(8, 8))
     else:
         ax = plt.gca()
+    ax.figure.set_facecolor(_CANVAS_COLOR)
+    ax.set_facecolor(_CANVAS_COLOR)
     ax.set_axis_off()
     if title != "": plt.title(title)
 
@@ -84,11 +88,20 @@ def visualize_scenario(
         _plot_fading_ribbon(
             ax,
             focal_gt,
-            width_m=1.8,
+            width_m=3.0,
             color=_GT_RIBBON_COLOR,
-            alpha_start=0.62,
-            alpha_end=0.18,
+            alpha_start=0.73,
+            alpha_end=0.3,
             zorder=30,
+        )
+        ax.plot(
+            focal_gt[:, 0],
+            focal_gt[:, 1],
+            color=_GT_CENTERLINE_COLOR,
+            linewidth=0.75,
+            alpha=0.45,
+            zorder=31,
+            solid_capstyle="round",
         )
 
     other_modes = None
@@ -100,8 +113,8 @@ def visualize_scenario(
             ax,
             color=_OTHER_PREDICTION_COLOR,
             grad_color=False,
-            alpha=0.6,
-            linewidth=1.7,
+            alpha=0.82,
+            linewidth=3.4,
             zorder=1000,
             arrow=False,
         )
@@ -112,7 +125,7 @@ def visualize_scenario(
                 color=_BEST_PREDICTION_COLOR,
                 grad_color=False,
                 alpha=1.0,
-                linewidth=2.55,
+                linewidth=4.2,
                 linestyle="-",
                 zorder=1010,
                 arrow=False,
@@ -123,7 +136,7 @@ def visualize_scenario(
         ax.scatter(
             other_modes[:, -1, 0],
             other_modes[:, -1, 1],
-            s=15,
+            s=36,
             marker="o",
             facecolors=_OTHER_ENDPOINT_COLOR,
             edgecolors="white",
@@ -132,66 +145,26 @@ def visualize_scenario(
             zorder=1015,
         )
 
-    gt_endpoint = focal_gt[-1] if focal_gt is not None and len(focal_gt) else None
-    endpoints_overlap = (
-        best_endpoint is not None
-        and gt_endpoint is not None
-        and np.linalg.norm(gt_endpoint - best_endpoint) < 0.6
-    )
-    if endpoints_overlap:
+    if best_endpoint is not None:
         ax.scatter(
-            gt_endpoint[0],
-            gt_endpoint[1],
+            best_endpoint[0],
+            best_endpoint[1],
             s=46,
-            marker="D",
-            facecolors=_GT_ENDPOINT_COLOR,
-            edgecolors="white",
-            linewidths=0.7,
+            marker="o",
+            facecolors="white",
+            edgecolors="none",
             zorder=1017,
         )
         ax.scatter(
             best_endpoint[0],
             best_endpoint[1],
-            s=22,
+            s=48,
             marker="o",
             facecolors=_BEST_PREDICTION_COLOR,
-            edgecolors="white",
-            linewidths=0.55,
+            edgecolors="#914936",
+            linewidths=0.65,
             zorder=1018,
         )
-    else:
-        if best_endpoint is not None:
-            ax.scatter(
-                best_endpoint[0],
-                best_endpoint[1],
-                s=46,
-                marker="o",
-                facecolors="white",
-                edgecolors="none",
-                zorder=1017,
-            )
-            ax.scatter(
-                best_endpoint[0],
-                best_endpoint[1],
-                s=28,
-                marker="o",
-                facecolors=_BEST_PREDICTION_COLOR,
-                edgecolors="#914936",
-                linewidths=0.65,
-                zorder=1018,
-            )
-        if gt_endpoint is not None:
-            ax.scatter(
-                gt_endpoint[0],
-                gt_endpoint[1],
-                s=32,
-                marker="D",
-                facecolors=_GT_ENDPOINT_COLOR,
-                edgecolors="white",
-                linewidths=0.75,
-                alpha=1.0,
-                zorder=1017,
-            )
 
     ax.set_aspect("equal", adjustable="box")
     ax.set_xlim(
@@ -211,10 +184,10 @@ def visualize_scenario(
 def _plot_fading_ribbon(
     ax,
     trajectory,
-    width_m=1.8,
-    color="#3C8D86",
-    alpha_start=0.62,
-    alpha_end=0.18,
+    width_m=1.7,
+    color="#69B6AC",
+    alpha_start=0.34,
+    alpha_end=0.05,
     zorder=30,
 ):
     """Draw a vehicle-width GT ribbon fading from current to future."""
@@ -257,12 +230,11 @@ def _plot_static_map_elements(
  
     for lane_segment in static_map.vector_lane_segments.values():
         centerline = static_map.get_lane_segment_centerline(lane_segment.id)
-        is_intersection = bool(getattr(lane_segment, "is_intersection", False))
         _plot_polylines(
             [centerline],
-            line_width=0.45 if is_intersection else 0.58,
-            color="#C4CCD1" if is_intersection else _LANE_SEGMENT_COLOR,
-            alpha=0.34 if is_intersection else 0.56,
+            line_width=1.5,
+            color=_LANE_SEGMENT_COLOR,
+            alpha=0.88,
             zorder=5,
         )
 
@@ -271,7 +243,7 @@ def _plot_static_map_elements(
             _plot_polylines(
                 [ped_xing.edge1.xyz, ped_xing.edge2.xyz],
                 line_width=0.55,
-                alpha=0.42,
+                alpha=0.55,
                 color=_CROSSWALK_COLOR,
                 zorder=6,
             )
@@ -353,9 +325,9 @@ def _plot_actor_tracks(
                 [history_trajectory],
                 color=_HISTORY_COLOR,
                 grad_color=False,
-                linewidth=1.85,
+                linewidth=4.1,
                 arrow=False,
-                alpha=0.92,
+                alpha=0.90,
                 zorder=998,
             )
         elif (
@@ -367,7 +339,7 @@ def _plot_actor_tracks(
                 [history_trajectory[-20:]],
                 color=_CONTEXT_HISTORY_COLOR,
                 grad_color=False,
-                linewidth=1.25,
+                linewidth=3.8,
                 arrow=False,
                 alpha=0.68,
                 zorder=190,
@@ -653,8 +625,8 @@ def _plot_actor_bounding_box(
         angle=np.degrees(heading),
         zorder=1030 if is_focal else _BOUNDING_BOX_ZORDER + 100,
         fc=color,
-        ec="#1D3145" if is_focal else _CONTEXT_ACTOR_EDGE_COLOR,
+        ec=_FOCAL_AGENT_EDGE_COLOR if is_focal else _CONTEXT_ACTOR_EDGE_COLOR,
         linewidth=0.85 if is_focal else 0.55,
-        alpha=1.0 if is_focal else 0.82,
+        alpha=1.0 if is_focal else 0.86,
     )
     ax.add_patch(vehicle_bounding_box)
