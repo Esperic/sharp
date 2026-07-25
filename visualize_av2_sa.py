@@ -348,7 +348,7 @@ def raw_split_dir(raw_data_root, split):
     raise FileNotFoundError(f"Raw AV2 split not found: {path}")
 
 
-def render_scene(pack, index, raw_dir, path, dpi):
+def render_scene(pack, index, raw_dir, path, dpi, annotate=True):
     import matplotlib
 
     matplotlib.use("Agg")
@@ -357,6 +357,16 @@ def render_scene(pack, index, raw_dir, path, dpi):
     from av2.map.map_api import ArgoverseStaticMap
 
     from src.utils.vis import visualize_scenario
+
+    plt.rcParams.update(
+        {
+            "font.family": "serif",
+            "font.size": 9,
+            "axes.titlesize": 9,
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
+        }
+    )
 
     scene_id = str(pack["scenario_id"][index])
     scene_dir = raw_dir / scene_id
@@ -367,10 +377,12 @@ def render_scene(pack, index, raw_dir, path, dpi):
         scene_dir / f"log_map_archive_{scene_id}.json"
     )
     candidate_id = int(pack["candidate_id"][index])
-    title = (
-        f"#{candidate_id:03d}  score={pack['score'][index]:.2f}  "
-        f"ADE/FDE={pack['min_ade'][index]:.2f}/{pack['min_fde'][index]:.2f}m"
-    )
+    title = ""
+    if annotate:
+        title = (
+            f"#{candidate_id:03d}  score={pack['score'][index]:.2f}  "
+            f"ADE/FDE={pack['min_ade'][index]:.2f}/{pack['min_fde'][index]:.2f}m"
+        )
     fig, ax = plt.subplots(figsize=(4.8, 4.8))
     plt.sca(ax)
     visualize_scenario(
@@ -380,20 +392,22 @@ def render_scene(pack, index, raw_dir, path, dpi):
         timestep=int(pack["timestep"][index]),
         title=title,
         create_fig=False,
+        best_pred=int(pack["best_mode"][index]),
     )
-    ax.text(
-        0.02,
-        0.98,
-        f"#{candidate_id:03d}",
-        transform=ax.transAxes,
-        ha="left",
-        va="top",
-        color="white",
-        fontsize=13,
-        fontweight="bold",
-        bbox={"facecolor": "black", "alpha": 0.75, "pad": 4, "edgecolor": "none"},
-        zorder=3000,
-    )
+    if annotate:
+        ax.text(
+            0.02,
+            0.98,
+            f"#{candidate_id:03d}",
+            transform=ax.transAxes,
+            ha="left",
+            va="top",
+            color="white",
+            fontsize=11,
+            fontweight="bold",
+            bbox={"facecolor": "#263238", "alpha": 0.82, "pad": 3, "edgecolor": "none"},
+            zorder=3000,
+        )
     fig.tight_layout(pad=0.5)
     fig.savefig(path, dpi=dpi, facecolor="white", bbox_inches="tight")
     plt.close(fig)
@@ -569,8 +583,18 @@ def run_render(args):
         index = int(np.flatnonzero(pack["candidate_id"] == candidate_id)[0])
         scene_id = str(pack["scenario_id"][index])
         path = selected_dir / f"{candidate_id:03d}_{scene_id}.{args.format}"
-        render_scene(pack, index, raw_dir, path, args.dpi)
+        render_scene(pack, index, raw_dir, path, args.dpi, annotate=args.annotate)
         print(path)
+
+
+def run_gallery(args):
+    if min(args.per_sheet, args.columns, args.thumbnail_dpi) <= 0:
+        raise ValueError("sheet, column and DPI values must be positive")
+    pack = load_candidates(args.output_dir)
+    sheets = render_candidate_gallery(pack, args)
+    print(Path(args.output_dir) / "gallery.html")
+    for sheet in sheets:
+        print(sheet)
 
 
 def self_check():
@@ -653,7 +677,23 @@ def build_parser():
     render.add_argument("--ids", required=True, help="for example: 1,4,7-9")
     render.add_argument("--format", choices=("png", "pdf"), default="png")
     render.add_argument("--dpi", type=int, default=300)
+    render.add_argument(
+        "--annotate",
+        action="store_true",
+        help="keep candidate number and screening metrics on publication render",
+    )
     render.set_defaults(func=run_render)
+
+    gallery = subparsers.add_parser(
+        "gallery", help="restyle the cached gallery without model inference"
+    )
+    gallery.add_argument("--output-dir", default="output/av2_candidates")
+    gallery.add_argument("--raw-data-root", required=True)
+    gallery.add_argument("--split", choices=("train", "val"), default="val")
+    gallery.add_argument("--per-sheet", type=int, default=12)
+    gallery.add_argument("--columns", type=int, default=4)
+    gallery.add_argument("--thumbnail-dpi", type=int, default=110)
+    gallery.set_defaults(func=run_gallery)
 
     check = subparsers.add_parser("self-check", help="run the lightweight scoring check")
     check.set_defaults(func=lambda _args: self_check())

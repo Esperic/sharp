@@ -7,9 +7,7 @@ from typing import Final, Optional, Sequence, Set, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
-from av2.datasets.motion_forecasting.data_schema import (ArgoverseScenario,
-                                                         ObjectType,
-                                                         TrackCategory)
+from av2.datasets.motion_forecasting.data_schema import ArgoverseScenario, ObjectType
 from av2.map.map_api import ArgoverseStaticMap
 from av2.utils.typing import NDArrayFloat, NDArrayInt
 from matplotlib.collections import LineCollection
@@ -23,21 +21,21 @@ _PlotBounds = Tuple[float, float, float, float]
 _OBS_DURATION_TIMESTEPS: Final[int] = 50
 _PRED_DURATION_TIMESTEPS: Final[int] = 60
 
-_ESTIMATED_VEHICLE_LENGTH_M: Final[float] = 5
-_ESTIMATED_VEHICLE_WIDTH_M: Final[float] = 2.5
-_ESTIMATED_CYCLIST_LENGTH_M: Final[float] = 2.0
-_ESTIMATED_CYCLIST_WIDTH_M: Final[float] = 0.7
-_PLOT_BOUNDS_BUFFER_W: Final[float] = 80
-_PLOT_BOUNDS_BUFFER_H: Final[float] = 80
+_ESTIMATED_VEHICLE_LENGTH_M: Final[float] = 4.5
+_ESTIMATED_VEHICLE_WIDTH_M: Final[float] = 2.0
+_ESTIMATED_CYCLIST_LENGTH_M: Final[float] = 1.8
+_ESTIMATED_CYCLIST_WIDTH_M: Final[float] = 0.6
+_PLOT_BOUNDS_BUFFER_W: Final[float] = 55
+_PLOT_BOUNDS_BUFFER_H: Final[float] = 55
 
-_DRIVABLE_AREA_COLOR: Final[str] = "#7A7A7A"
-_LANE_SEGMENT_COLOR: Final[str] = "#E0E0E0"
-# _LANE_SEGMENT_COLOR: Final[str] = "#"
-
-_DEFAULT_ACTOR_COLOR: Final[str] = "#815847"  # "#D3E8EF"
-_HISTORY_COLOR: Final[str] = "#d34836"
-_FOCAL_AGENT_COLOR: Final[str] = "#ff9a3a"
-_AV_COLOR: Final[str] = "#007672"
+_DRIVABLE_AREA_COLOR: Final[str] = "#F6F7F9"
+_LANE_SEGMENT_COLOR: Final[str] = "#BCC2C9"
+_DEFAULT_ACTOR_COLOR: Final[str] = "#D5D9DE"
+_FOCAL_AGENT_COLOR: Final[str] = "#3D648A"
+_HISTORY_COLOR: Final[str] = "#009E73"
+_GROUND_TRUTH_COLOR: Final[str] = "#2487C5"
+_BEST_PREDICTION_COLOR: Final[str] = "#6240B5"
+_OTHER_PREDICTION_COLOR: Final[str] = "#F09A94"
 _BOUNDING_BOX_ZORDER: Final[int] = 100
 
 _STATIC_OBJECT_TYPES: Set[ObjectType] = {
@@ -66,8 +64,7 @@ def visualize_scenario(
         fig, ax = plt.subplots(1, 1, figsize=(8, 8))
     else:
         ax = plt.gca()
-    ax.get_xaxis().set_visible(False)
-    ax.get_yaxis().set_visible(False)
+    ax.set_axis_off()
     if title != "": plt.title(title)
 
     # Plot static map elements and actor tracks
@@ -77,73 +74,35 @@ def visualize_scenario(
     plot_bounds = cur_plot_bounds
 
     if prediction is not None:
-        if best_pred < 0:
+        other_modes = prediction if best_pred < 0 else np.delete(prediction, best_pred, axis=0)
+        _scatter_polylines(
+            other_modes,
+            ax,
+            color=_OTHER_PREDICTION_COLOR,
+            grad_color=False,
+            alpha=0.72,
+            linewidth=1.35,
+            zorder=1000,
+            arrow=False,
+        )
+        if best_pred >= 0:
             _scatter_polylines(
-                prediction[:, :, :],
+                prediction[best_pred][None],
                 ax,
-                color="#ffc187",
-                grad_color=False,
-                alpha=0.8,
-                linewidth=3,
-                zorder=1000,
-                arrow=False
-            )
-            plt.scatter(
-                prediction[:, -1, 0],
-                prediction[:, -1, 1],
-                color="#ff993b",
-                alpha=1,
-                zorder=2000,
-                marker="*",
-                s=200
-            )
-        else:
-            _scatter_polylines(
-                prediction[:, :, :],
-                ax,
-                color="#ffc187",
-                grad_color=False,
-                alpha=0.1,
-                linewidth=3,
-                zorder=1000,
-                arrow=False
-            )
-            plt.scatter(
-                prediction[:, -1, 0],
-                prediction[:, -1, 1],
-                color="#ff993b",
-                alpha=0.3,
-                zorder=2000,
-                marker="*",
-                s=200
-            )
-            best_prediction = prediction[best_pred, :, :][np.newaxis, :, :]
-            _scatter_polylines(
-                best_prediction,
-                ax,
-                color="#ffc187",
+                color=_BEST_PREDICTION_COLOR,
                 grad_color=False,
                 alpha=1.0,
-                linewidth=4,
-                zorder=1000,
-                arrow=False
-            )
-            plt.scatter(
-                best_prediction[:, -1, 0],
-                best_prediction[:, -1, 1],
-                color="#ff993b",
-                alpha=1.0,
-                zorder=2000,
-                marker="*",
-                s=200
+                linewidth=2.5,
+                zorder=1001,
+                arrow=False,
             )
 
 
-    plt.axis("equal")
-    plt.xlim(
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlim(
         plot_bounds[0] - _PLOT_BOUNDS_BUFFER_W, plot_bounds[0] + _PLOT_BOUNDS_BUFFER_W
     )
-    plt.ylim(
+    ax.set_ylim(
         plot_bounds[1] - _PLOT_BOUNDS_BUFFER_H, plot_bounds[1] + _PLOT_BOUNDS_BUFFER_H
     )
     if tight: plt.tight_layout()
@@ -163,30 +122,30 @@ def _plot_static_map_elements(
         static_map: Static map containing elements to be plotted.
         show_ped_xings: Configures whether pedestrian crossings should be plotted.
     """
-    # Plot drivable areas
-    _plot_polygons([drivable_area.xyz for drivable_area in static_map.vector_drivable_areas.values()], alpha=0.3, color=_DRIVABLE_AREA_COLOR) 
+    _plot_polygons(
+        [area.xyz for area in static_map.vector_drivable_areas.values()],
+        alpha=1.0,
+        color=_DRIVABLE_AREA_COLOR,
+    )
  
-    # Plot lane segments
     for lane_segment in static_map.vector_lane_segments.values():
         centerline = static_map.get_lane_segment_centerline(lane_segment.id)
         _plot_polylines(
-            [centerline], line_width=2.0, color="#000000", alpha=0.2, style="--"
-        )
-        _plot_polylines(
             [centerline],
-            line_width=3,
-            color=[0.3, 0.3, 0.3],
-            endpoint=True,
-            zorder=98,
+            line_width=0.75,
+            color=_LANE_SEGMENT_COLOR,
+            alpha=0.72,
+            zorder=5,
         )
 
-    # Plot pedestrian crossings
     if show_ped_xings:
         for ped_xing in static_map.vector_pedestrian_crossings.values():
             _plot_polylines(
                 [ped_xing.edge1.xyz, ped_xing.edge2.xyz],
-                alpha=1.0,
-                color="white",
+                line_width=0.65,
+                alpha=0.65,
+                color="#C9CED4",
+                zorder=6,
             )
 
 
@@ -233,7 +192,7 @@ def _plot_actor_tracks(
             ]
         )
         if len(future_trajectory.shape) > 1:
-            future_trajectory = future_trajectory[:59, :]
+            future_trajectory = future_trajectory[:60, :]
 
         # Get actor trajectory and heading history
         history_trajectory: NDArrayFloat = np.array(
@@ -251,34 +210,36 @@ def _plot_actor_tracks(
             ]
         )
 
-        # Plot polyline for focal agent location history
-        track_color = _DEFAULT_ACTOR_COLOR
-        from matplotlib.colors import LinearSegmentedColormap
-
-        predcmp = LinearSegmentedColormap.from_list("pred", [[105/255.0, 172/255.0, 160/255.0], [180/255.0, 214/255.0, 208/255.0]], N=256)
-        #if (track.category == TrackCategory.FOCAL_TRACK or track.category == TrackCategory.SCORED_TRACK) and len(future_trajectory) > 0 and show_future: #DO ALL (MULTI-AGENT)
-        if (track.category == TrackCategory.FOCAL_TRACK) and len(future_trajectory) > 0 and show_future: #DO SINGLE-AGENT
+        is_focal = track.track_id == focal_id
+        if is_focal and len(future_trajectory) > 0 and show_future:
             _scatter_polylines(
                 [future_trajectory],
-                cmap=predcmp,#"Greens",
-                linewidth=12,
-                reverse=False,
+                color=_GROUND_TRUTH_COLOR,
+                grad_color=False,
+                linewidth=2.0,
+                linestyle=":",
                 arrow=False,
                 alpha=1.0,
-                zorder=199
+                zorder=1002,
             )
         elif track.object_type in _STATIC_OBJECT_TYPES:
             continue
 
-        track_color = _DEFAULT_ACTOR_COLOR
-        hist_cmap = LinearSegmentedColormap.from_list("pred", [[126/255.0, 135/255.0, 167/255.0], [44/255.0, 51/255.0, 80/255.0]], N=128) 
-        if show_history: _scatter_polylines([history_trajectory], cmap=hist_cmap, linewidth=8, arrow=False, alpha=0.9)
-        
-        if track.track_id == focal_id:
-            track_bounds = history_trajectory[-1]
-            track_color = _FOCAL_AGENT_COLOR
+        if is_focal and show_history:
+            _scatter_polylines(
+                [history_trajectory],
+                color=_HISTORY_COLOR,
+                grad_color=False,
+                linewidth=2.3,
+                arrow=False,
+                alpha=1.0,
+                zorder=998,
+            )
 
-        # Plot bounding boxes for all vehicles and cyclists
+        track_color = _FOCAL_AGENT_COLOR if is_focal else _DEFAULT_ACTOR_COLOR
+        if is_focal:
+            track_bounds = history_trajectory[-1]
+
         if track.object_type == ObjectType.VEHICLE:
             _plot_actor_bounding_box(
                 ax,
@@ -286,6 +247,7 @@ def _plot_actor_tracks(
                 actor_headings[-1],
                 track_color,
                 (_ESTIMATED_VEHICLE_LENGTH_M, _ESTIMATED_VEHICLE_WIDTH_M),
+                is_focal,
             )
         elif (
             track.object_type == ObjectType.CYCLIST
@@ -297,6 +259,7 @@ def _plot_actor_tracks(
                 actor_headings[-1],
                 track_color,
                 (_ESTIMATED_CYCLIST_LENGTH_M, _ESTIMATED_CYCLIST_WIDTH_M),
+                is_focal,
             )
         else:
             plt.plot(
@@ -304,7 +267,10 @@ def _plot_actor_tracks(
                 history_trajectory[-1, 1],
                 "o",
                 color=track_color,
-                markersize=11,
+                markeredgecolor="#AEB4BA" if not is_focal else _FOCAL_AGENT_COLOR,
+                markeredgewidth=0.45,
+                markersize=5.0 if not is_focal else 6.0,
+                alpha=0.75 if not is_focal else 1.0,
                 zorder=999
             )
 
@@ -476,7 +442,7 @@ def _plot_polygons(
             polygon[:, 0],
             polygon[:, 1],
             fc=to_rgba(color, alpha),
-            ec="black",
+            ec="none",
             linewidth=0,
             zorder=2,
         )
@@ -488,6 +454,7 @@ def _plot_actor_bounding_box(
     heading: float,
     color: str,
     bbox_size: Tuple[float, float],
+    is_focal: bool,
 ) -> None:
     """Plot an actor bounding box centered on the actor's current location.
 
@@ -511,9 +478,10 @@ def _plot_actor_bounding_box(
         bbox_length,
         bbox_width,
         angle=np.degrees(heading),
-        zorder=_BOUNDING_BOX_ZORDER + 100,
+        zorder=1003 if is_focal else _BOUNDING_BOX_ZORDER + 100,
         fc=color,
-        ec="dimgrey",
-        alpha=1.0,
+        ec="#294B6C" if is_focal else "#AEB4BA",
+        linewidth=0.7 if is_focal else 0.45,
+        alpha=1.0 if is_focal else 0.72,
     )
     ax.add_patch(vehicle_bounding_box)
