@@ -28,14 +28,18 @@ _ESTIMATED_CYCLIST_WIDTH_M: Final[float] = 0.6
 _PLOT_BOUNDS_BUFFER_W: Final[float] = 55
 _PLOT_BOUNDS_BUFFER_H: Final[float] = 55
 
-_DRIVABLE_AREA_COLOR: Final[str] = "#F6F7F9"
-_LANE_SEGMENT_COLOR: Final[str] = "#BCC2C9"
-_DEFAULT_ACTOR_COLOR: Final[str] = "#D5D9DE"
-_FOCAL_AGENT_COLOR: Final[str] = "#3D648A"
-_HISTORY_COLOR: Final[str] = "#009E73"
-_GROUND_TRUTH_COLOR: Final[str] = "#2487C5"
-_BEST_PREDICTION_COLOR: Final[str] = "#6240B5"
-_OTHER_PREDICTION_COLOR: Final[str] = "#F09A94"
+_DRIVABLE_AREA_COLOR: Final[str] = "#EEF6F3"
+_LANE_SEGMENT_COLOR: Final[str] = "#9DB6AF"
+_CROSSWALK_COLOR: Final[str] = "#C8B89F"
+_DEFAULT_ACTOR_COLOR: Final[str] = "#AFCBE3"
+_CYCLIST_COLOR: Final[str] = "#B8D8C0"
+_PEDESTRIAN_COLOR: Final[str] = "#E7BFA9"
+_CONTEXT_ACTOR_EDGE_COLOR: Final[str] = "#78909C"
+_FOCAL_AGENT_COLOR: Final[str] = "#355070"
+_HISTORY_COLOR: Final[str] = "#355070"
+_GROUND_TRUTH_COLOR: Final[str] = "#2A9D8F"
+_BEST_PREDICTION_COLOR: Final[str] = "#E76F51"
+_OTHER_PREDICTION_COLOR: Final[str] = "#9B8AC4"
 _BOUNDING_BOX_ZORDER: Final[int] = 100
 
 _STATIC_OBJECT_TYPES: Set[ObjectType] = {
@@ -80,11 +84,23 @@ def visualize_scenario(
             ax,
             color=_OTHER_PREDICTION_COLOR,
             grad_color=False,
-            alpha=0.72,
-            linewidth=1.35,
+            alpha=0.62,
+            linewidth=1.15,
             zorder=1000,
             arrow=False,
         )
+        if len(other_modes):
+            ax.scatter(
+                other_modes[:, -1, 0],
+                other_modes[:, -1, 1],
+                s=9,
+                marker="o",
+                facecolors="white",
+                edgecolors=_OTHER_PREDICTION_COLOR,
+                linewidths=0.7,
+                alpha=0.9,
+                zorder=1003,
+            )
         if best_pred >= 0:
             _scatter_polylines(
                 prediction[best_pred][None],
@@ -92,9 +108,19 @@ def visualize_scenario(
                 color=_BEST_PREDICTION_COLOR,
                 grad_color=False,
                 alpha=1.0,
-                linewidth=2.5,
+                linewidth=2.3,
                 zorder=1001,
                 arrow=False,
+            )
+            ax.scatter(
+                prediction[best_pred, -1, 0],
+                prediction[best_pred, -1, 1],
+                s=12,
+                marker="o",
+                facecolors=_BEST_PREDICTION_COLOR,
+                edgecolors="white",
+                linewidths=0.5,
+                zorder=1004,
             )
 
 
@@ -144,7 +170,7 @@ def _plot_static_map_elements(
                 [ped_xing.edge1.xyz, ped_xing.edge2.xyz],
                 line_width=0.65,
                 alpha=0.65,
-                color="#C9CED4",
+                color=_CROSSWALK_COLOR,
                 zorder=6,
             )
 
@@ -216,7 +242,7 @@ def _plot_actor_tracks(
                 [future_trajectory],
                 color=_GROUND_TRUTH_COLOR,
                 grad_color=False,
-                linewidth=2.0,
+                linewidth=1.9,
                 linestyle=":",
                 arrow=False,
                 alpha=1.0,
@@ -230,13 +256,20 @@ def _plot_actor_tracks(
                 [history_trajectory],
                 color=_HISTORY_COLOR,
                 grad_color=False,
-                linewidth=2.3,
+                linewidth=2.1,
                 arrow=False,
                 alpha=1.0,
                 zorder=998,
             )
 
-        track_color = _FOCAL_AGENT_COLOR if is_focal else _DEFAULT_ACTOR_COLOR
+        if is_focal:
+            track_color = _FOCAL_AGENT_COLOR
+        elif track.object_type == ObjectType.VEHICLE:
+            track_color = _DEFAULT_ACTOR_COLOR
+        elif track.object_type in (ObjectType.CYCLIST, ObjectType.MOTORCYCLIST):
+            track_color = _CYCLIST_COLOR
+        else:
+            track_color = _PEDESTRIAN_COLOR
         if is_focal:
             track_bounds = history_trajectory[-1]
 
@@ -267,9 +300,11 @@ def _plot_actor_tracks(
                 history_trajectory[-1, 1],
                 "o",
                 color=track_color,
-                markeredgecolor="#AEB4BA" if not is_focal else _FOCAL_AGENT_COLOR,
-                markeredgewidth=0.45,
-                markersize=5.0 if not is_focal else 6.0,
+                markeredgecolor=(
+                    _CONTEXT_ACTOR_EDGE_COLOR if not is_focal else "white"
+                ),
+                markeredgewidth=0.45 if not is_focal else 1.1,
+                markersize=5.0 if not is_focal else 7.0,
                 alpha=0.75 if not is_focal else 1.0,
                 zorder=999
             )
@@ -424,6 +459,9 @@ def _scatter_polylines(
                 zorder=zorder,
                 alpha=alpha,
                 linestyle=linestyle,
+                solid_capstyle="round",
+                solid_joinstyle="round",
+                dash_capstyle="round",
             )
 
 
@@ -473,6 +511,20 @@ def _plot_actor_bounding_box(
     pivot_x = cur_location[0] - (d / 2) * math.cos(heading + theta_2)
     pivot_y = cur_location[1] - (d / 2) * math.sin(heading + theta_2)
 
+    if is_focal:
+        ax.add_patch(
+            Rectangle(
+                (pivot_x, pivot_y),
+                bbox_length,
+                bbox_width,
+                angle=np.degrees(heading),
+                zorder=1002,
+                fc="none",
+                ec="white",
+                linewidth=3.0,
+            )
+        )
+
     vehicle_bounding_box = Rectangle(
         (pivot_x, pivot_y),
         bbox_length,
@@ -480,8 +532,8 @@ def _plot_actor_bounding_box(
         angle=np.degrees(heading),
         zorder=1003 if is_focal else _BOUNDING_BOX_ZORDER + 100,
         fc=color,
-        ec="#294B6C" if is_focal else "#AEB4BA",
-        linewidth=0.7 if is_focal else 0.45,
+        ec="#243B53" if is_focal else _CONTEXT_ACTOR_EDGE_COLOR,
+        linewidth=1.0 if is_focal else 0.45,
         alpha=1.0 if is_focal else 0.72,
     )
     ax.add_patch(vehicle_bounding_box)
