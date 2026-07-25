@@ -14,7 +14,6 @@ from av2.utils.typing import NDArrayFloat, NDArrayInt
 from matplotlib.collections import LineCollection
 from matplotlib.colors import to_rgba
 from matplotlib.legend_handler import HandlerLineCollection
-from matplotlib.lines import Line2D
 from matplotlib.patches import Rectangle
 
 _PlotBounds = Tuple[float, float, float, float]
@@ -38,11 +37,11 @@ _CYCLIST_COLOR: Final[str] = "#8EB69E"
 _PEDESTRIAN_COLOR: Final[str] = "#C59A6C"
 _CONTEXT_ACTOR_EDGE_COLOR: Final[str] = "#708593"
 _FOCAL_AGENT_COLOR: Final[str] = "#244A6B"
-_HISTORY_COLOR: Final[str] = "#315B7D"
-_GROUND_TRUTH_COLOR: Final[str] = "#16846F"
-_BEST_PREDICTION_COLOR: Final[str] = "#D95F3B"
-_OTHER_PREDICTION_COLOR: Final[str] = "#7482A3"
-_OTHER_ENDPOINT_COLOR: Final[str] = "#5F6F93"
+_HISTORY_COLOR: Final[str] = "#2F5673"
+_GROUND_TRUTH_COLOR: Final[str] = "#3C8D86"
+_BEST_PREDICTION_COLOR: Final[str] = "#C96A50"
+_OTHER_PREDICTION_COLOR: Final[str] = "#7986A6"
+_OTHER_ENDPOINT_COLOR: Final[str] = "#5F6D8E"
 _BOUNDING_BOX_ZORDER: Final[int] = 100
 
 _STATIC_OBJECT_TYPES: Set[ObjectType] = {
@@ -66,7 +65,6 @@ def visualize_scenario(
     show_history=True,
     show_map=True,
     best_pred=-1,
-    show_legend=False,
 ) -> None:
     if create_fig:
         fig, ax = plt.subplots(1, 1, figsize=(8, 8))
@@ -90,8 +88,8 @@ def visualize_scenario(
             ax,
             color=_OTHER_PREDICTION_COLOR,
             grad_color=False,
-            alpha=0.40,
-            linewidth=1.05,
+            alpha=0.38,
+            linewidth=1.0,
             zorder=1000,
             arrow=False,
         )
@@ -102,7 +100,8 @@ def visualize_scenario(
                 color=_BEST_PREDICTION_COLOR,
                 grad_color=False,
                 alpha=1.0,
-                linewidth=2.65,
+                linewidth=2.6,
+                linestyle="-",
                 zorder=1010,
                 arrow=False,
                 halo=True,
@@ -117,7 +116,7 @@ def visualize_scenario(
             color=_GROUND_TRUTH_COLOR,
             grad_color=False,
             linewidth=2.20,
-            linestyle=(0, (5.0, 2.4)),
+            linestyle=(0, (3.2, 1.8)),
             arrow=False,
             alpha=1.0,
             zorder=1012,
@@ -173,7 +172,7 @@ def visualize_scenario(
             s=20,
             marker="o",
             facecolors=_BEST_PREDICTION_COLOR,
-            edgecolors="white",
+            edgecolors="#914936",
             linewidths=0.5,
             zorder=1019,
         )
@@ -194,7 +193,7 @@ def visualize_scenario(
                 s=28,
                 marker="o",
                 facecolors=_BEST_PREDICTION_COLOR,
-                edgecolors="#9D3F2B",
+                edgecolors="#914936",
                 linewidths=0.65,
                 zorder=1018,
             )
@@ -210,41 +209,6 @@ def visualize_scenario(
                 alpha=1.0,
                 zorder=1019,
             )
-
-    if show_legend:
-        ax.legend(
-            handles=[
-                Line2D(
-                    [0], [0], color=_HISTORY_COLOR, linewidth=1.85,
-                    label="Observed history",
-                ),
-                Line2D(
-                    [0], [0], color=_OTHER_PREDICTION_COLOR, linewidth=1.05,
-                    marker="o", markerfacecolor=_OTHER_ENDPOINT_COLOR,
-                    markeredgecolor="white", markersize=4,
-                    label="Other predictions",
-                ),
-                Line2D(
-                    [0], [0], color=_BEST_PREDICTION_COLOR, linewidth=2.65,
-                    marker="o", markerfacecolor=_BEST_PREDICTION_COLOR,
-                    markeredgecolor="white", markersize=5,
-                    label="Oracle best",
-                ),
-                Line2D(
-                    [0], [0], color=_GROUND_TRUTH_COLOR, linewidth=2.2,
-                    linestyle=(0, (5.0, 2.4)), marker="D",
-                    markerfacecolor=_GROUND_TRUTH_COLOR, markeredgecolor="white",
-                    markersize=4.5, label="Ground truth",
-                ),
-            ],
-            loc="upper left",
-            frameon=False,
-            fontsize=7.5,
-            handlelength=2.5,
-            handletextpad=0.6,
-            labelspacing=0.35,
-            borderaxespad=0.6,
-        )
 
     ax.set_aspect("equal", adjustable="box")
     ax.set_xlim(
