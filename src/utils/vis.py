@@ -5,6 +5,7 @@ import math
 from pathlib import Path
 from typing import Final, Optional, Sequence, Set, Tuple
 
+import matplotlib.patheffects as pe
 import matplotlib.pyplot as plt
 import numpy as np
 from av2.datasets.motion_forecasting.data_schema import ArgoverseScenario, ObjectType
@@ -28,18 +29,18 @@ _ESTIMATED_CYCLIST_WIDTH_M: Final[float] = 0.6
 _PLOT_BOUNDS_BUFFER_W: Final[float] = 55
 _PLOT_BOUNDS_BUFFER_H: Final[float] = 55
 
-_DRIVABLE_AREA_COLOR: Final[str] = "#EEF6F3"
-_LANE_SEGMENT_COLOR: Final[str] = "#9DB6AF"
-_CROSSWALK_COLOR: Final[str] = "#C8B89F"
-_DEFAULT_ACTOR_COLOR: Final[str] = "#AFCBE3"
-_CYCLIST_COLOR: Final[str] = "#B8D8C0"
-_PEDESTRIAN_COLOR: Final[str] = "#E7BFA9"
-_CONTEXT_ACTOR_EDGE_COLOR: Final[str] = "#78909C"
-_FOCAL_AGENT_COLOR: Final[str] = "#355070"
-_HISTORY_COLOR: Final[str] = "#355070"
-_GROUND_TRUTH_COLOR: Final[str] = "#2A9D8F"
+_DRIVABLE_AREA_COLOR: Final[str] = "#F3F5F6"
+_LANE_SEGMENT_COLOR: Final[str] = "#AAB4BA"
+_CROSSWALK_COLOR: Final[str] = "#C8CDD1"
+_DEFAULT_ACTOR_COLOR: Final[str] = "#B8C6CF"
+_CYCLIST_COLOR: Final[str] = "#AFC8BC"
+_PEDESTRIAN_COLOR: Final[str] = "#C9AD91"
+_CONTEXT_ACTOR_EDGE_COLOR: Final[str] = "#7D8C95"
+_FOCAL_AGENT_COLOR: Final[str] = "#29445F"
+_HISTORY_COLOR: Final[str] = "#29445F"
+_GROUND_TRUTH_COLOR: Final[str] = "#23967F"
 _BEST_PREDICTION_COLOR: Final[str] = "#E76F51"
-_OTHER_PREDICTION_COLOR: Final[str] = "#9B8AC4"
+_OTHER_PREDICTION_COLOR: Final[str] = "#7F88A3"
 _BOUNDING_BOX_ZORDER: Final[int] = 100
 
 _STATIC_OBJECT_TYPES: Set[ObjectType] = {
@@ -84,8 +85,8 @@ def visualize_scenario(
             ax,
             color=_OTHER_PREDICTION_COLOR,
             grad_color=False,
-            alpha=0.62,
-            linewidth=1.15,
+            alpha=0.32,
+            linewidth=1.0,
             zorder=1000,
             arrow=False,
         )
@@ -93,13 +94,13 @@ def visualize_scenario(
             ax.scatter(
                 other_modes[:, -1, 0],
                 other_modes[:, -1, 1],
-                s=9,
+                s=14,
                 marker="o",
-                facecolors="white",
-                edgecolors=_OTHER_PREDICTION_COLOR,
-                linewidths=0.7,
-                alpha=0.9,
-                zorder=1003,
+                facecolors=_OTHER_PREDICTION_COLOR,
+                edgecolors="white",
+                linewidths=0.55,
+                alpha=0.82,
+                zorder=1004,
             )
         if best_pred >= 0:
             _scatter_polylines(
@@ -108,19 +109,32 @@ def visualize_scenario(
                 color=_BEST_PREDICTION_COLOR,
                 grad_color=False,
                 alpha=1.0,
-                linewidth=2.3,
-                zorder=1001,
+                linewidth=2.6,
+                zorder=1010,
                 arrow=False,
+                halo=True,
+                halo_width=1.35,
+            )
+            best_endpoint = prediction[best_pred, -1]
+            ax.scatter(
+                best_endpoint[0],
+                best_endpoint[1],
+                s=48,
+                marker="o",
+                facecolors="white",
+                edgecolors="white",
+                linewidths=0,
+                zorder=1014,
             )
             ax.scatter(
-                prediction[best_pred, -1, 0],
-                prediction[best_pred, -1, 1],
-                s=12,
+                best_endpoint[0],
+                best_endpoint[1],
+                s=30,
                 marker="o",
                 facecolors=_BEST_PREDICTION_COLOR,
-                edgecolors="white",
-                linewidths=0.5,
-                zorder=1004,
+                edgecolors="#A94332",
+                linewidths=0.65,
+                zorder=1015,
             )
 
 
@@ -158,9 +172,9 @@ def _plot_static_map_elements(
         centerline = static_map.get_lane_segment_centerline(lane_segment.id)
         _plot_polylines(
             [centerline],
-            line_width=0.75,
+            line_width=0.52,
             color=_LANE_SEGMENT_COLOR,
-            alpha=0.72,
+            alpha=0.42,
             zorder=5,
         )
 
@@ -168,8 +182,8 @@ def _plot_static_map_elements(
         for ped_xing in static_map.vector_pedestrian_crossings.values():
             _plot_polylines(
                 [ped_xing.edge1.xyz, ped_xing.edge2.xyz],
-                line_width=0.65,
-                alpha=0.65,
+                line_width=0.55,
+                alpha=0.42,
                 color=_CROSSWALK_COLOR,
                 zorder=6,
             )
@@ -242,11 +256,24 @@ def _plot_actor_tracks(
                 [future_trajectory],
                 color=_GROUND_TRUTH_COLOR,
                 grad_color=False,
-                linewidth=1.9,
-                linestyle=":",
+                linewidth=2.25,
+                linestyle=(0, (5.5, 2.8)),
                 arrow=False,
                 alpha=1.0,
-                zorder=1002,
+                zorder=1008,
+                halo=True,
+                halo_width=1.20,
+            )
+            gt_endpoint = future_trajectory[-1]
+            ax.scatter(
+                gt_endpoint[0],
+                gt_endpoint[1],
+                s=34,
+                marker="D",
+                facecolors=_GROUND_TRUTH_COLOR,
+                edgecolors="white",
+                linewidths=0.8,
+                zorder=1013,
             )
         elif track.object_type in _STATIC_OBJECT_TYPES:
             continue
@@ -256,10 +283,20 @@ def _plot_actor_tracks(
                 [history_trajectory],
                 color=_HISTORY_COLOR,
                 grad_color=False,
-                linewidth=2.1,
+                linewidth=1.75,
                 arrow=False,
-                alpha=1.0,
+                alpha=0.88,
                 zorder=998,
+            )
+            ax.scatter(
+                history_trajectory[-1, 0],
+                history_trajectory[-1, 1],
+                s=18,
+                marker="o",
+                facecolors=_HISTORY_COLOR,
+                edgecolors="white",
+                linewidths=0.6,
+                zorder=1012,
             )
 
         if is_focal:
@@ -404,6 +441,8 @@ def _scatter_polylines(
     grad_color: bool = True,
     color=None,
     linestyle="-",
+    halo=False,
+    halo_width=1.0,
 ) -> None:
     """Plot a group of polylines with the specified config.
 
@@ -451,7 +490,7 @@ def _scatter_polylines(
             lc.set_linewidth(linewidth)
             ax.add_collection(lc)
         else:
-            ax.plot(
+            line, = ax.plot(
                 inter_poly[:, 0],
                 inter_poly[:, 1],
                 color=color,
@@ -463,6 +502,17 @@ def _scatter_polylines(
                 solid_joinstyle="round",
                 dash_capstyle="round",
             )
+            if halo:
+                line.set_path_effects(
+                    [
+                        pe.Stroke(
+                            linewidth=linewidth + halo_width,
+                            foreground="white",
+                            alpha=0.95,
+                        ),
+                        pe.Normal(),
+                    ]
+                )
 
 
 def _plot_polygons(
@@ -521,7 +571,7 @@ def _plot_actor_bounding_box(
                 zorder=1002,
                 fc="none",
                 ec="white",
-                linewidth=3.0,
+                linewidth=1.4,
             )
         )
 
@@ -532,8 +582,8 @@ def _plot_actor_bounding_box(
         angle=np.degrees(heading),
         zorder=1003 if is_focal else _BOUNDING_BOX_ZORDER + 100,
         fc=color,
-        ec="#243B53" if is_focal else _CONTEXT_ACTOR_EDGE_COLOR,
-        linewidth=1.0 if is_focal else 0.45,
+        ec="#1D3145" if is_focal else _CONTEXT_ACTOR_EDGE_COLOR,
+        linewidth=0.85 if is_focal else 0.45,
         alpha=1.0 if is_focal else 0.72,
     )
     ax.add_patch(vehicle_bounding_box)
