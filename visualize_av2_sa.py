@@ -393,6 +393,7 @@ def render_scene(pack, index, raw_dir, path, dpi, annotate=True):
         title=title,
         create_fig=False,
         best_pred=int(pack["best_mode"][index]),
+        show_legend=not annotate,
     )
     if annotate:
         ax.text(

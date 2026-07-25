@@ -14,6 +14,7 @@ from av2.utils.typing import NDArrayFloat, NDArrayInt
 from matplotlib.collections import LineCollection
 from matplotlib.colors import to_rgba
 from matplotlib.legend_handler import HandlerLineCollection
+from matplotlib.lines import Line2D
 from matplotlib.patches import Rectangle
 
 _PlotBounds = Tuple[float, float, float, float]
@@ -26,21 +27,22 @@ _ESTIMATED_VEHICLE_LENGTH_M: Final[float] = 4.5
 _ESTIMATED_VEHICLE_WIDTH_M: Final[float] = 2.0
 _ESTIMATED_CYCLIST_LENGTH_M: Final[float] = 1.8
 _ESTIMATED_CYCLIST_WIDTH_M: Final[float] = 0.6
-_PLOT_BOUNDS_BUFFER_W: Final[float] = 55
-_PLOT_BOUNDS_BUFFER_H: Final[float] = 55
+_PLOT_BOUNDS_BUFFER_W: Final[float] = 48
+_PLOT_BOUNDS_BUFFER_H: Final[float] = 44
 
-_DRIVABLE_AREA_COLOR: Final[str] = "#F3F5F6"
-_LANE_SEGMENT_COLOR: Final[str] = "#AAB4BA"
-_CROSSWALK_COLOR: Final[str] = "#C8CDD1"
-_DEFAULT_ACTOR_COLOR: Final[str] = "#B8C6CF"
-_CYCLIST_COLOR: Final[str] = "#AFC8BC"
-_PEDESTRIAN_COLOR: Final[str] = "#C9AD91"
-_CONTEXT_ACTOR_EDGE_COLOR: Final[str] = "#7D8C95"
-_FOCAL_AGENT_COLOR: Final[str] = "#29445F"
-_HISTORY_COLOR: Final[str] = "#29445F"
-_GROUND_TRUTH_COLOR: Final[str] = "#23967F"
-_BEST_PREDICTION_COLOR: Final[str] = "#E76F51"
-_OTHER_PREDICTION_COLOR: Final[str] = "#7F88A3"
+_DRIVABLE_AREA_COLOR: Final[str] = "#F1F4F5"
+_LANE_SEGMENT_COLOR: Final[str] = "#AEBAC1"
+_CROSSWALK_COLOR: Final[str] = "#C3CACF"
+_DEFAULT_ACTOR_COLOR: Final[str] = "#AFC3D0"
+_CYCLIST_COLOR: Final[str] = "#8EB69E"
+_PEDESTRIAN_COLOR: Final[str] = "#C59A6C"
+_CONTEXT_ACTOR_EDGE_COLOR: Final[str] = "#708593"
+_FOCAL_AGENT_COLOR: Final[str] = "#244A6B"
+_HISTORY_COLOR: Final[str] = "#315B7D"
+_GROUND_TRUTH_COLOR: Final[str] = "#16846F"
+_BEST_PREDICTION_COLOR: Final[str] = "#D95F3B"
+_OTHER_PREDICTION_COLOR: Final[str] = "#7482A3"
+_OTHER_ENDPOINT_COLOR: Final[str] = "#5F6F93"
 _BOUNDING_BOX_ZORDER: Final[int] = 100
 
 _STATIC_OBJECT_TYPES: Set[ObjectType] = {
@@ -63,7 +65,8 @@ def visualize_scenario(
     show_future=True,
     show_history=True,
     show_map=True,
-    best_pred=-1
+    best_pred=-1,
+    show_legend=False,
 ) -> None:
     if create_fig:
         fig, ax = plt.subplots(1, 1, figsize=(8, 8))
@@ -74,10 +77,12 @@ def visualize_scenario(
 
     # Plot static map elements and actor tracks
     if show_map: _plot_static_map_elements(scenario_static_map, True)
-    cur_plot_bounds = _plot_actor_tracks(ax, scenario, timestep, show_history, show_future, show_map)
-    #print(cur_plot_bounds)
-    plot_bounds = cur_plot_bounds
+    plot_bounds, focal_history, focal_gt = _plot_actor_tracks(
+        ax, scenario, timestep, show_history, show_future, show_map
+    )
 
+    other_modes = None
+    best_endpoint = None
     if prediction is not None:
         other_modes = prediction if best_pred < 0 else np.delete(prediction, best_pred, axis=0)
         _scatter_polylines(
@@ -85,23 +90,11 @@ def visualize_scenario(
             ax,
             color=_OTHER_PREDICTION_COLOR,
             grad_color=False,
-            alpha=0.32,
-            linewidth=1.0,
+            alpha=0.40,
+            linewidth=1.05,
             zorder=1000,
             arrow=False,
         )
-        if len(other_modes):
-            ax.scatter(
-                other_modes[:, -1, 0],
-                other_modes[:, -1, 1],
-                s=14,
-                marker="o",
-                facecolors=_OTHER_PREDICTION_COLOR,
-                edgecolors="white",
-                linewidths=0.55,
-                alpha=0.82,
-                zorder=1004,
-            )
         if best_pred >= 0:
             _scatter_polylines(
                 prediction[best_pred][None],
@@ -109,34 +102,149 @@ def visualize_scenario(
                 color=_BEST_PREDICTION_COLOR,
                 grad_color=False,
                 alpha=1.0,
-                linewidth=2.6,
+                linewidth=2.65,
                 zorder=1010,
                 arrow=False,
                 halo=True,
-                halo_width=1.35,
+                halo_width=1.25,
             )
             best_endpoint = prediction[best_pred, -1]
+
+    if show_future and focal_gt is not None and len(focal_gt):
+        _scatter_polylines(
+            [focal_gt],
+            ax,
+            color=_GROUND_TRUTH_COLOR,
+            grad_color=False,
+            linewidth=2.20,
+            linestyle=(0, (5.0, 2.4)),
+            arrow=False,
+            alpha=1.0,
+            zorder=1012,
+            halo=False,
+        )
+
+    if focal_history is not None and len(focal_history):
+        current_position = focal_history[-1]
+        ax.scatter(
+            current_position[0],
+            current_position[1],
+            s=24,
+            marker="o",
+            facecolors="white",
+            edgecolors=_FOCAL_AGENT_COLOR,
+            linewidths=1.25,
+            zorder=1020,
+        )
+
+    if other_modes is not None and len(other_modes):
+        ax.scatter(
+            other_modes[:, -1, 0],
+            other_modes[:, -1, 1],
+            s=15,
+            marker="o",
+            facecolors=_OTHER_ENDPOINT_COLOR,
+            edgecolors="white",
+            linewidths=0.55,
+            alpha=0.95,
+            zorder=1015,
+        )
+
+    gt_endpoint = focal_gt[-1] if focal_gt is not None and len(focal_gt) else None
+    endpoints_overlap = (
+        best_endpoint is not None
+        and gt_endpoint is not None
+        and np.linalg.norm(gt_endpoint - best_endpoint) < 0.6
+    )
+    if endpoints_overlap:
+        ax.scatter(
+            gt_endpoint[0],
+            gt_endpoint[1],
+            s=44,
+            marker="D",
+            facecolors=_GROUND_TRUTH_COLOR,
+            edgecolors="white",
+            linewidths=0.7,
+            zorder=1018,
+        )
+        ax.scatter(
+            best_endpoint[0],
+            best_endpoint[1],
+            s=20,
+            marker="o",
+            facecolors=_BEST_PREDICTION_COLOR,
+            edgecolors="white",
+            linewidths=0.5,
+            zorder=1019,
+        )
+    else:
+        if best_endpoint is not None:
             ax.scatter(
                 best_endpoint[0],
                 best_endpoint[1],
-                s=48,
+                s=46,
                 marker="o",
                 facecolors="white",
-                edgecolors="white",
-                linewidths=0,
-                zorder=1014,
+                edgecolors="none",
+                zorder=1017,
             )
             ax.scatter(
                 best_endpoint[0],
                 best_endpoint[1],
-                s=30,
+                s=28,
                 marker="o",
                 facecolors=_BEST_PREDICTION_COLOR,
-                edgecolors="#A94332",
+                edgecolors="#9D3F2B",
                 linewidths=0.65,
-                zorder=1015,
+                zorder=1018,
+            )
+        if gt_endpoint is not None:
+            ax.scatter(
+                gt_endpoint[0],
+                gt_endpoint[1],
+                s=34,
+                marker="D",
+                facecolors=_GROUND_TRUTH_COLOR,
+                edgecolors="white",
+                linewidths=0.8,
+                alpha=1.0,
+                zorder=1019,
             )
 
+    if show_legend:
+        ax.legend(
+            handles=[
+                Line2D(
+                    [0], [0], color=_HISTORY_COLOR, linewidth=1.85,
+                    label="Observed history",
+                ),
+                Line2D(
+                    [0], [0], color=_OTHER_PREDICTION_COLOR, linewidth=1.05,
+                    marker="o", markerfacecolor=_OTHER_ENDPOINT_COLOR,
+                    markeredgecolor="white", markersize=4,
+                    label="Other predictions",
+                ),
+                Line2D(
+                    [0], [0], color=_BEST_PREDICTION_COLOR, linewidth=2.65,
+                    marker="o", markerfacecolor=_BEST_PREDICTION_COLOR,
+                    markeredgecolor="white", markersize=5,
+                    label="Oracle best",
+                ),
+                Line2D(
+                    [0], [0], color=_GROUND_TRUTH_COLOR, linewidth=2.2,
+                    linestyle=(0, (5.0, 2.4)), marker="D",
+                    markerfacecolor=_GROUND_TRUTH_COLOR, markeredgecolor="white",
+                    markersize=4.5, label="Ground truth",
+                ),
+            ],
+            loc="upper left",
+            frameon=False,
+            fontsize=7.5,
+            handlelength=2.5,
+            handletextpad=0.6,
+            labelspacing=0.35,
+            borderaxespad=0.6,
+        )
 
     ax.set_aspect("equal", adjustable="box")
     ax.set_xlim(
@@ -170,11 +278,12 @@ def _plot_static_map_elements(
  
     for lane_segment in static_map.vector_lane_segments.values():
         centerline = static_map.get_lane_segment_centerline(lane_segment.id)
+        is_intersection = bool(getattr(lane_segment, "is_intersection", False))
         _plot_polylines(
             [centerline],
-            line_width=0.52,
-            color=_LANE_SEGMENT_COLOR,
-            alpha=0.42,
+            line_width=0.45 if is_intersection else 0.58,
+            color="#C4CCD1" if is_intersection else _LANE_SEGMENT_COLOR,
+            alpha=0.34 if is_intersection else 0.56,
             zorder=5,
         )
 
@@ -196,7 +305,7 @@ def _plot_actor_tracks(
     show_history: bool,
     show_future: bool,
     show_map: bool
-) -> Optional[_PlotBounds]:
+) -> Tuple[Optional[NDArrayFloat], Optional[NDArrayFloat], Optional[NDArrayFloat]]:
     """Plot all actor tracks (up to a particular time step) associated with an Argoverse scenario.
 
     Args:
@@ -208,6 +317,8 @@ def _plot_actor_tracks(
         track_bounds: (x_min, x_max, y_min, y_max) bounds for the extent of actor tracks.
     """
     track_bounds = None
+    focal_history = None
+    focal_future = None
     focal_id = scenario.focal_track_id
 
     for track in scenario.tracks:
@@ -251,31 +362,13 @@ def _plot_actor_tracks(
         )
 
         is_focal = track.track_id == focal_id
-        if is_focal and len(future_trajectory) > 0 and show_future:
-            _scatter_polylines(
-                [future_trajectory],
-                color=_GROUND_TRUTH_COLOR,
-                grad_color=False,
-                linewidth=2.25,
-                linestyle=(0, (5.5, 2.8)),
-                arrow=False,
-                alpha=1.0,
-                zorder=1008,
-                halo=True,
-                halo_width=1.20,
-            )
-            gt_endpoint = future_trajectory[-1]
-            ax.scatter(
-                gt_endpoint[0],
-                gt_endpoint[1],
-                s=34,
-                marker="D",
-                facecolors=_GROUND_TRUTH_COLOR,
-                edgecolors="white",
-                linewidths=0.8,
-                zorder=1013,
-            )
-        elif track.object_type in _STATIC_OBJECT_TYPES:
+        if is_focal:
+            focal_history = history_trajectory
+            if len(future_trajectory) > 0:
+                focal_future = future_trajectory
+            track_bounds = history_trajectory[-1]
+
+        if track.object_type in _STATIC_OBJECT_TYPES:
             continue
 
         if is_focal and show_history:
@@ -283,20 +376,10 @@ def _plot_actor_tracks(
                 [history_trajectory],
                 color=_HISTORY_COLOR,
                 grad_color=False,
-                linewidth=1.75,
+                linewidth=1.85,
                 arrow=False,
-                alpha=0.88,
+                alpha=0.92,
                 zorder=998,
-            )
-            ax.scatter(
-                history_trajectory[-1, 0],
-                history_trajectory[-1, 1],
-                s=18,
-                marker="o",
-                facecolors=_HISTORY_COLOR,
-                edgecolors="white",
-                linewidths=0.6,
-                zorder=1012,
             )
 
         if is_focal:
@@ -307,9 +390,6 @@ def _plot_actor_tracks(
             track_color = _CYCLIST_COLOR
         else:
             track_color = _PEDESTRIAN_COLOR
-        if is_focal:
-            track_bounds = history_trajectory[-1]
-
         if track.object_type == ObjectType.VEHICLE:
             _plot_actor_bounding_box(
                 ax,
@@ -342,11 +422,11 @@ def _plot_actor_tracks(
                 ),
                 markeredgewidth=0.45 if not is_focal else 1.1,
                 markersize=5.0 if not is_focal else 7.0,
-                alpha=0.75 if not is_focal else 1.0,
-                zorder=999
+                alpha=0.82 if not is_focal else 1.0,
+                zorder=1030 if is_focal else 200,
             )
 
-    return track_bounds
+    return track_bounds, focal_history, focal_future
 
 
 class HandlerColorLineCollection(HandlerLineCollection):
@@ -568,7 +648,7 @@ def _plot_actor_bounding_box(
                 bbox_length,
                 bbox_width,
                 angle=np.degrees(heading),
-                zorder=1002,
+                zorder=1029,
                 fc="none",
                 ec="white",
                 linewidth=1.4,
@@ -580,10 +660,10 @@ def _plot_actor_bounding_box(
         bbox_length,
         bbox_width,
         angle=np.degrees(heading),
-        zorder=1003 if is_focal else _BOUNDING_BOX_ZORDER + 100,
+        zorder=1030 if is_focal else _BOUNDING_BOX_ZORDER + 100,
         fc=color,
         ec="#1D3145" if is_focal else _CONTEXT_ACTOR_EDGE_COLOR,
-        linewidth=0.85 if is_focal else 0.45,
-        alpha=1.0 if is_focal else 0.72,
+        linewidth=0.85 if is_focal else 0.55,
+        alpha=1.0 if is_focal else 0.82,
     )
     ax.add_patch(vehicle_bounding_box)
