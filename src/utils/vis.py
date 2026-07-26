@@ -30,7 +30,7 @@ _PLOT_BOUNDS_BUFFER_W: Final[float] = 48
 _PLOT_BOUNDS_BUFFER_H: Final[float] = 44
 
 _CANVAS_COLOR: Final[str] = "#FCFBF8"
-_DRIVABLE_AREA_COLOR: Final[str] = "#F1F1F1"
+_DRIVABLE_AREA_COLOR: Final[str] = "#F7F7F7"
 _LANE_SEGMENT_COLOR: Final[str] = "#BFC8CC"
 _CROSSWALK_COLOR: Final[str] = "#D7D0C4"
 _DEFAULT_ACTOR_COLOR: Final[str] = "#9CB1BDDA"
@@ -44,7 +44,7 @@ _CONTEXT_HISTORY_COLOR: Final[str] = "#718794"
 _BEST_PREDICTION_COLOR: Final[str] = "#C96A50"
 _OTHER_PREDICTION_COLOR = "#7C83B9"
 _OTHER_ENDPOINT_COLOR = "#5F679C"
-_GT_RIBBON_COLOR: Final[str] = "#479DBE"
+_GT_RIBBON_COLOR: Final[str] = "#47BE9A"
 _GT_CENTERLINE_COLOR: Final[str] = "#4A968E"
 _BOUNDING_BOX_ZORDER: Final[int] = 100
 
@@ -91,7 +91,7 @@ def visualize_scenario(
             width_m=3.0,
             color=_GT_RIBBON_COLOR,
             alpha_start=0.73,
-            alpha_end=0.3,
+            alpha_end=0.25,
             zorder=30,
         )
         ax.plot(
